@@ -28,7 +28,7 @@ if ! brew list python-tk >/dev/null 2>&1; then
 fi
 PY="$(brew --prefix)/bin/python3"
 
-# 3. BlackHole (시스템 소리 캐처용 가상 장치)
+# 3. BlackHole (시스템 소리 캡처용 가상 장치)
 if ! [ -e /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver ]; then
   step "BlackHole 설치 (Mac 암호 입력 필요)"
   brew install blackhole-2ch || fail "BlackHole 설치 실패"

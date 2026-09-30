@@ -15,6 +15,12 @@ if ! command -v brew >/dev/null; then
   eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)"
 fi
 
+# 1b. Xcode 가 설치된 Mac 은 라이선스 동의가 안 돼 있으면 brew 가 멈춤
+if xcode-select -p >/dev/null 2>&1 && ! xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
+  step "Xcode 라이선스 동의 (Mac 암호 입력)"
+  sudo xcodebuild -license accept || fail "Xcode 라이선스 동의 실패. 터미널에서 'sudo xcodebuild -license accept' 실행 후 다시 시도"
+fi
+
 # 2. Python + Tk
 if ! brew list python-tk >/dev/null 2>&1; then
   step "Python 설치 (1~3분)"

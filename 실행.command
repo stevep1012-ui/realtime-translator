@@ -64,6 +64,6 @@ EOF
   read -n 1 -s -r -p "위 설정을 마쳤으면 아무 키나 누르세요."; echo
 fi
 
-# 6. 실행 (첫 실행이면 API 키 입력창이 뜨)
+# 6. 실행 (첫 실행이면 API 키 입력창이 뜸)
 step "실시간번역기 시작. 자막은 이 폴더에 자동 저장됩니다."
 .venv/bin/python realtime_translator.py

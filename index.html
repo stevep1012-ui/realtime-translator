@@ -79,12 +79,14 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
 
 <div class="sheet" id="settings" hidden>
   <h2>처음 설정</h2>
-  <p>키는 이 폰의 브라우저에만 저장됩니다. 두 서비스 모두 소액 충전이 필요합니다 (1시간 ≈ 500~1,000원).</p>
+  <p>키는 한 번 입력하면 이 폰에 저장돼 다음부터 자동으로 쓰입니다. 서버로는 보내지 않습니다. iPhone 은 홈 화면에 추가해 쓰면 저장이 가장 오래 유지됩니다. 두 서비스 모두 소액 충전이 필요합니다 (1시간 ≈ 500~1,000원).</p>
   <div class="field"><label for="okey">OpenAI API 키 (음성 인식)</label><input id="okey" type="password" autocomplete="off" placeholder="sk-..."><a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">키 발급 페이지 열기</a></div>
   <div class="field"><label for="akey">Anthropic API 키 (번역)</label><input id="akey" type="password" autocomplete="off" placeholder="sk-ant-..."><a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">키 발급 페이지 열기</a></div>
   <div class="field"><label for="src">화자 언어</label><select id="src"><option value="">자동 감지 (영어·일본어 등 섞여도 됨)</option><option value="en">영어</option><option value="ja">일본어</option><option value="zh">중국어</option><option value="es">스페인어</option><option value="fr">프랑스어</option><option value="de">독일어</option><option value="ko">한국어</option></select></div>
   <div class="field"><label for="tgt">자막 언어</label><input id="tgt" value="한국어"></div>
+  <div class="field"><label for="rev">자막 언어로 말할 때 번역할 언어 (비우면 번역 안 함)</label><input id="rev" value="English"></div>
   <div class="err" id="err"></div>
+  <div class="hint" id="keyState"></div>
   <div class="row"><button class="big" id="btnSaveSettings" type="button">저장</button><button class="icon" id="btnCloseSettings" type="button">닫기</button></div>
 </div>
 
@@ -98,15 +100,16 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
 <script>
 (() => {
 const $ = id => document.getElementById(id);
-const cfg = {okey:"", akey:"", src:"", tgt:"한국어"};
+const cfg = {okey:"", akey:"", src:"", tgt:"한국어", rev:"English"};
 const store = {
   load(){ try{ Object.assign(cfg, JSON.parse(localStorage.getItem("rt_cfg")||"{}")); }catch(e){} },
-  save(){ try{ localStorage.setItem("rt_cfg", JSON.stringify(cfg)); }catch(e){} }
+  save(){ try{ localStorage.setItem("rt_cfg", JSON.stringify(cfg)); }catch(e){}
+    try{ navigator.storage?.persist?.(); }catch(e){} }   // 브라우저가 저장값을 지우지 않도록 요청
 };
 store.load();
 
 // ---------- 설정 ----------
-function openSettings(){ $("okey").value=cfg.okey; $("akey").value=cfg.akey; $("src").value=cfg.src; $("tgt").value=cfg.tgt; $("err").textContent=""; $("settings").hidden=false; }
+function openSettings(){ $("okey").value=cfg.okey; $("akey").value=cfg.akey; $("src").value=cfg.src; $("tgt").value=cfg.tgt; $("rev").value=cfg.rev; $("err").textContent=""; $("keyState").textContent=cfg.okey&&cfg.akey?"✓ 키가 이 기기에 저장돼 있습니다":""; $("settings").hidden=false; }
 $("btnSettings").onclick = openSettings;
 $("btnCloseSettings").onclick = () => { $("settings").hidden = true; };
 $("btnSaveSettings").onclick = () => {
@@ -114,7 +117,7 @@ $("btnSaveSettings").onclick = () => {
   if(!o.startsWith("sk-")) return $("err").textContent="OpenAI 키는 sk- 로 시작합니다";
   if(!a.startsWith("sk-ant-")) return $("err").textContent="Anthropic 키는 sk-ant- 로 시작합니다";
   if(!t) return $("err").textContent="자막 언어를 입력하세요";
-  Object.assign(cfg,{okey:o,akey:a,src:$("src").value,tgt:t}); store.save(); $("settings").hidden=true;
+  Object.assign(cfg,{okey:o,akey:a,src:$("src").value,tgt:t,rev:$("rev").value.trim()}); store.save(); $("settings").hidden=true;
 };
 if(!cfg.okey||!cfg.akey) openSettings();
 
@@ -145,7 +148,7 @@ async function translateStream(text,onText){
   const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
     "content-type":"application/json","x-api-key":cfg.akey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
     body:JSON.stringify({model:"claude-haiku-4-5",max_tokens:300,stream:true,
-      system:`Translate meeting speech (any language) into natural ${cfg.tgt} subtitles. If the text is already ${cfg.tgt}, return it unchanged. Output only the translation. Previous context: ${prev}`,
+      system:`Translate meeting speech (any language) into natural ${cfg.tgt} subtitles. ${cfg.rev ? `If the text is already ${cfg.tgt}, translate it into ${cfg.rev} instead.` : `If the text is already ${cfg.tgt}, return it unchanged.`} Output only the translation. Previous context: ${prev}`,
       messages:[{role:"user",content:text}]})});
   if(!r.ok) throw new Error("번역 "+r.status+" (Anthropic 키·크레딧 확인)");
   const rd=r.body.getReader(), dec=new TextDecoder(); let buf="", acc="";

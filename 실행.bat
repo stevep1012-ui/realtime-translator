@@ -32,7 +32,7 @@ if not exist .venv (
   .venv\Scripts\pip install -q numpy openai anthropic pyaudiowpatch || goto :fail_pip
 )
 
-rem 3. 실행 (첫 실행이면 API 키 입력창이 뜨)
+rem 3. 실행 (첫 실행이면 API 키 입력창이 뜸)
 echo.
 echo ▶ 실시간번역기 시작. 자막은 이 폴더에 자동 저장됩니다.
 .venv\Scripts\python realtime_translator.py

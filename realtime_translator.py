@@ -193,7 +193,7 @@ def capture_mac():
 
 
 def capture_windows():
-    """WASAPI 루프백으로 기본 스피커 출력을 직접 캐처 (가상 장치 불필요)."""
+    """WASAPI 루프백으로 기본 스피커 출력을 직접 캡처 (가상 장치 불필요)."""
     import pyaudiowpatch as pyaudio
     p = pyaudio.PyAudio()
     dev = p.get_default_wasapi_loopback()

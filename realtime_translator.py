@@ -44,11 +44,13 @@ STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
 TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", "claude-haiku-4-5")
 SOURCE_LANG = os.getenv("SOURCE_LANG", "").strip()    # STT 언어 코드. 빈값 = 자동 감지(영어·일본어 등)
 TARGET_LANG = os.getenv("TARGET_LANG", "한국어")       # 번역 목표 언어 (자연어 이름)
+REVERSE_LANG = os.getenv("REVERSE_LANG", "English")   # 화자가 이미 목표 언어로 말하면 이 언어로 번역 (빈값 = 그대로 표시)
 MAX_LINES = 4           # 화면에 유지할 번역 항목 수
 FONT = "Malgun Gothic" if sys.platform == "win32" else "Apple SD Gothic Neo"
 KO_SIZE = int(os.getenv("KO_SIZE", "15"))   # 번역문 글자 크기
 EN_SIZE = int(os.getenv("EN_SIZE", "11"))   # 원문 글자 크기
 SAVE_DIR = os.getenv("CAPTION_SAVE_DIR", HERE)
+CAPTURE_MIC = os.getenv("CAPTURE_MIC", "1") != "0"   # 내 마이크도 같이 인식 (0 이면 끔)
 
 def setup_dialog():
     """API 키가 없으면 입력창을 띄워 .env 를 만든다. 취소하면 종료."""
@@ -122,6 +124,7 @@ if not (os.getenv("OPENAI_API_KEY") and os.getenv("ANTHROPIC_API_KEY")):
     setup_dialog()
     SOURCE_LANG = os.getenv("SOURCE_LANG", "").strip()
     TARGET_LANG = os.getenv("TARGET_LANG", "한국어")
+    REVERSE_LANG = os.getenv("REVERSE_LANG", "English")
 
 openai_client = OpenAI()      # OPENAI_API_KEY
 claude = Anthropic()          # ANTHROPIC_API_KEY
@@ -130,8 +133,8 @@ stt_q: queue.Queue[tuple[int, str]] = queue.Queue()      # (id, 영어)
 text_q: queue.Queue[tuple[int, str]] = queue.Queue()     # (id, 표시문)
 
 
-def make_vad():
-    """16kHz 모노 블록을 받아, 말이 끊기는 지점에서 발화 단위로 audio_q에 넣는 함수 반환."""
+def make_vad(tag=""):
+    """16kHz 모노 블록을 받아, 말이 끊기는 지점에서 발화 단위로 audio_q에 넣는 함수 반환. tag 는 화자 표시."""
     buf = []            # 현재 발화 (말 시작 후 누적)
     speech_sec = 0.0
     silence_sec = 0.0
@@ -139,7 +142,7 @@ def make_vad():
     def flush():
         nonlocal buf, speech_sec, silence_sec
         if speech_sec >= MIN_SPEECH_SEC:
-            audio_q.put(np.concatenate(buf))
+            audio_q.put((np.concatenate(buf), tag))
         buf, speech_sec, silence_sec = [], 0.0, 0.0
 
     def feed(block: np.ndarray):
@@ -171,15 +174,22 @@ def capture_mac():
     if dev is None:
         raise RuntimeError(f"입력 장치 '{INPUT_DEVICE}' 없음. BlackHole 설치·설정 확인")
     print(f"[capture] device={dev} {sd.query_devices(dev)['name']}", flush=True)
-    feed = make_vad()
-
-    def cb(indata, n, t, status):
-        feed(indata[:, 0].copy())
-
-    with sd.InputStream(device=dev, samplerate=SAMPLE_RATE, channels=1,
-                        dtype="float32", blocksize=int(SAMPLE_RATE * BLOCK_SEC),
-                        callback=cb):
-        threading.Event().wait()
+    feed_spk = make_vad()
+    feed_mic = make_vad("(나) ")
+    bs = int(SAMPLE_RATE * BLOCK_SEC)
+    streams = [sd.InputStream(device=dev, samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                              blocksize=bs, callback=lambda d, n, t, s: feed_spk(d[:, 0].copy()))]
+    if CAPTURE_MIC:
+        try:
+            mic = sd.default.device[0]
+            print(f"[capture] mic={mic} {sd.query_devices(mic)['name']}", flush=True)
+            streams.append(sd.InputStream(device=mic, samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                          blocksize=bs, callback=lambda d, n, t, s: feed_mic(d[:, 0].copy())))
+        except Exception as e:
+            print(f"[capture] 마이크 사용 불가: {e}", flush=True)
+    for st in streams:
+        st.start()
+    threading.Event().wait()
 
 
 def capture_windows():
@@ -190,21 +200,31 @@ def capture_windows():
     rate = int(dev["defaultSampleRate"])
     ch = int(dev["maxInputChannels"])
     print(f"[capture] loopback {dev['name']} {rate}Hz {ch}ch", flush=True)
-    feed = make_vad()
-    n_in = int(rate * BLOCK_SEC)
     n_out = int(SAMPLE_RATE * BLOCK_SEC)
 
-    def cb(data, frame_count, time_info, status):
-        x = np.frombuffer(data, dtype=np.float32).reshape(-1, ch).mean(axis=1)
-        if rate != SAMPLE_RATE:      # 16kHz로 리샘플
-            x = np.interp(np.linspace(0, len(x), n_out, endpoint=False),
-                          np.arange(len(x)), x).astype(np.float32)
-        feed(x)
-        return (None, pyaudio.paContinue)
+    def open_stream(d, feed):
+        r, c = int(d["defaultSampleRate"]), int(d["maxInputChannels"])
 
-    p.open(format=pyaudio.paFloat32, channels=ch, rate=rate, input=True,
-           input_device_index=dev["index"], frames_per_buffer=n_in,
-           stream_callback=cb)
+        def cb(data, frame_count, time_info, status):
+            x = np.frombuffer(data, dtype=np.float32).reshape(-1, c).mean(axis=1)
+            if r != SAMPLE_RATE:      # 16kHz로 리샘플
+                x = np.interp(np.linspace(0, len(x), n_out, endpoint=False),
+                              np.arange(len(x)), x).astype(np.float32)
+            feed(x)
+            return (None, pyaudio.paContinue)
+
+        return p.open(format=pyaudio.paFloat32, channels=c, rate=r, input=True,
+                      input_device_index=d["index"], frames_per_buffer=int(r * BLOCK_SEC),
+                      stream_callback=cb)
+
+    open_stream(dev, make_vad())
+    if CAPTURE_MIC:
+        try:
+            mic = p.get_default_input_device_info()
+            print(f"[capture] mic {mic['name']}", flush=True)
+            open_stream(mic, make_vad("(나) "))
+        except Exception as e:
+            print(f"[capture] 마이크 사용 불가: {e}", flush=True)
     threading.Event().wait()
 
 
@@ -237,8 +257,9 @@ def translate_stream(en: str, prev: str):
     with claude.messages.stream(
             model=TRANSLATE_MODEL, max_tokens=300,
             system=f"Translate meeting speech (any language) into natural {TARGET_LANG} subtitles. "
-                   f"If the text is already {TARGET_LANG}, return it unchanged. "
-                   f"Output only the translation. Previous context: {prev}",
+                   + (f"If the text is already {TARGET_LANG}, translate it into {REVERSE_LANG} instead. "
+                      if REVERSE_LANG else f"If the text is already {TARGET_LANG}, return it unchanged. ")
+                   + f"Output only the translation. Previous context: {prev}",
             messages=[{"role": "user", "content": en}]) as s:
         for piece in s.text_stream:
             acc += piece
@@ -248,16 +269,16 @@ def translate_stream(en: str, prev: str):
 def stt_worker():
     seq = 0
     while True:
-        samples = audio_q.get()
+        samples, tag = audio_q.get()
         t0 = time.time()
         try:
             en = transcribe(samples)
             if not en:
                 continue
             seq += 1
-            print(f"[stt {seq}] {time.time()-t0:.2f}s  {en}", flush=True)
-            text_q.put((seq, "…", en))            # 영어 먼저 표시
-            stt_q.put((seq, en, time.time()))
+            print(f"[stt {seq}] {time.time()-t0:.2f}s  {tag}{en}", flush=True)
+            text_q.put((seq, "…", tag + en))      # 원문 먼저 표시
+            stt_q.put((seq, en, tag, time.time()))
         except Exception as e:
             print(f"[STT 오류] {e!r}", flush=True)
             text_q.put((0, f"[STT 오류] {e}", ""))
@@ -266,20 +287,20 @@ def stt_worker():
 def translate_worker():
     prev = ""
     while True:
-        seq, en, t0 = stt_q.get()
+        seq, en, tag, t0 = stt_q.get()
         try:
             ko = ""
             first = None
             for ko in translate_stream(en, prev):
                 if first is None:
                     first = time.time() - t0
-                text_q.put((seq, ko, en))          # 부분 번역을 계속 갱신
+                text_q.put((seq, tag + ko, tag + en))   # 부분 번역을 계속 갱신
             print(f"[ko {seq}] 첫글자 {first:.2f}s 완료 {time.time()-t0:.2f}s  {ko}",
                   flush=True)
             prev = en
         except Exception as e:
             print(f"[번역 오류] {e!r}", flush=True)
-            text_q.put((seq, f"[번역 오류] {e}", en))
+            text_q.put((seq, f"[번역 오류] {e}", tag + en))
 
 
 def ui():

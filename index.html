@@ -140,15 +140,16 @@ function setStat(text, live){ $("stat").textContent=text; $("dot").classList.tog
 async function transcribe(wav){
   const fd=new FormData(); fd.append("file",wav,"chunk.wav"); fd.append("model","gpt-4o-mini-transcribe");
   if(cfg.src) fd.append("language",cfg.src);
-  fd.append("prompt","Business meeting about enterprise communications. Terms: "+PRODUCT_TERMS+".");
+  fd.append("prompt","Business meeting about enterprise communications. Terms: "+PRODUCT_TERMS+"."+(lastSrc?" Previous: "+lastSrc:""));
   let r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd});
   if(r.status===404||r.status===400){ fd.set("model","whisper-1"); r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd}); }
   if(!r.ok) throw new Error("음성 인식 "+(await apiError(r)));
   const t=(await r.json()).text.trim();
-  if(/Business meeting about enterprise|Terms: Mitel|MiVoice Connect, MiVoice MX-ONE/.test(t)) return "";  // 불분명한 소리에 힌트 문장이 그대로 나오는 경우 버림
+  if(/Business meeting about enterprise|Terms: Mitel|MiVoice Connect, MiVoice MX-ONE|^Previous:/.test(t)) return "";  // 불분명한 소리에 힌트 문장이 그대로 나오는 경우 버림
   return fixTerms(t);
 }
 const hist=[];  // 최근 (원문, 번역)
+let lastSrc="";  // 직전 인식 문장 (다음 인식의 문맥 힌트)
 const Q=()=>cfg.mode!=="fast";
 const PRODUCT_TERMS="Mitel, MiCollab, MiVoice Business, MiVoice Connect, MiVoice MX-ONE, MX-ONE, MiContact Center, MiCloud, CloudLink, OpenScape, Unify, Microsoft Teams, Zoom, Webex, Avaya, Genesys, Five9";
 const TERM_FIXES=[[/\b(?:my|mi|me)[\s-]?collab\b/gi,"MiCollab"],[/\b(?:my|mi)[\s-]?contact center\b/gi,"MiContact Center"],[/\bmi[\s-]?cloud\b/gi,"MiCloud"],[/\bmy[\s-]?voice (business|connect)\b/gi,(_,x)=>"MiVoice "+x[0].toUpperCase()+x.slice(1).toLowerCase()],[/\bmy[\s-]tel\b/gi,"Mitel"]];
@@ -173,7 +174,7 @@ async function translateStream(text,onText){
     r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
       "content-type":"application/json","x-api-key":cfg.akey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
       body:JSON.stringify({model,max_tokens:400,stream:true,system:sysPrompt(),messages:[{role:"user",content:text}]})});
-    if(r.ok){ goodModel[mode]=model; break; }
+    if(r.ok){ if(goodModel[mode]!==model&&running) setStat("듣는 중 · "+model.replace("claude-","").replace(/-\d{8}$/,""),true); goodModel[mode]=model; break; }
     err=await apiError(r);
     if(r.status!==404&&r.status!==400) break;   // 모델 문제가 아니면 다른 모델 시도 안 함
   }
@@ -185,16 +186,17 @@ async function translateStream(text,onText){
       if(j.type==="content_block_delta"&&j.delta?.text){ acc+=j.delta.text; onText(acc); } }catch(e){} } }
   hist.push([text,acc]); while(hist.length>(Q()?6:3)) hist.shift(); return acc;
 }
-const queue=[]; let busy=false;
+const queue=[]; let busy=false, tchain=Promise.resolve();
 async function pump(){
   if(busy) return; busy=true;
   while(queue.length){ const wav=queue.shift(); const {el,rec}=addCap();
     try{ const src=await transcribe(wav); if(!src){ el.remove(); history.pop(); continue; }
+      lastSrc=src.slice(-200);
       rec.src=src; el.querySelector(".src").textContent=src;
-      // 번역은 기다리지 않고 다음 청크 인식으로 넘어감
-      translateStream(src,t=>{ rec.ko=t; el.querySelector(".ko").textContent=t; feed.scrollTop=feed.scrollHeight; })
+      // 인식은 계속 진행, 번역은 순서대로 (직전 번역을 문맥으로 쓰기 위해)
+      tchain=tchain.then(()=>translateStream(src,t=>{ rec.ko=t; el.querySelector(".ko").textContent=t; feed.scrollTop=feed.scrollHeight; }))
         .then(()=>el.classList.remove("pending"))
-        .catch(e=>{ rec.ko="[오류] "+e.message; el.querySelector(".ko").textContent=rec.ko; });
+        .catch(e=>{ rec.ko="[오류] "+e.message; el.querySelector(".ko").textContent=rec.ko; el.classList.remove("pending"); });
     }catch(e){ rec.ko="[오류] "+e.message; el.querySelector(".ko").textContent=rec.ko; el.classList.remove("pending"); }
   }
   busy=false;
@@ -213,22 +215,24 @@ function toWav(f32){
 }
 async function start(){
   try{
-    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:true,autoGainControl:true}});
   }catch(e){ setStat("마이크 권한 필요"); alert("마이크 사용을 허용해 주세요. 허용 창이 안 뜨면 이 페이지를 Safari/Chrome 에서 직접 여세요."); return; }
   ctx=new (window.AudioContext||window.webkitAudioContext)(); await ctx.resume();
   const srcNode=ctx.createMediaStreamSource(stream); node=ctx.createScriptProcessor(4096,1,1);
-  const ratio=ctx.sampleRate/RATE; let buf=[], sp=0, sil=0; const PAUSE=Q()?0.6:0.35, MAXSP=Q()?8:4;
+  const ratio=ctx.sampleRate/RATE; let buf=[], sp=0, sil=0, noise=SIL/2; const PAUSE=Q()?0.6:0.35, MAXSP=Q()?10:4;
   const flush=()=>{ if(sp>=MINSP){ const n=buf.reduce((a,b)=>a+b.length,0), out=new Float32Array(n); let o=0; for(const b of buf){out.set(b,o);o+=b.length;} queue.push(toWav(out)); pump(); } buf=[]; sp=0; sil=0; };
   node.onaudioprocess=e=>{
     const inp=e.inputBuffer.getChannelData(0); const n=Math.floor(inp.length/ratio); const blk=new Float32Array(n);
-    for(let i=0;i<n;i++) blk[i]=inp[Math.floor(i*ratio)];
+    for(let i=0;i<n;i++){ const a=Math.floor(i*ratio), b=Math.min(inp.length,Math.floor((i+1)*ratio)); let acc=0; for(let k=a;k<b;k++) acc+=inp[k]; blk[i]=acc/Math.max(1,b-a); }  // 구간 평균으로 줄여 소리 뭉개짐 방지
     let s=0; for(let i=0;i<n;i++) s+=blk[i]*blk[i]; const rms=Math.sqrt(s/n), dt=n/RATE;
-    if(rms>=SIL){ buf.push(blk); sp+=dt; sil=0; } else if(buf.length){ buf.push(blk); sil+=dt; if(sil>=PAUSE) flush(); }
+    if(rms<noise*3) noise=noise*0.95+rms*0.05;  // 주변 소음 수준을 계속 추적
+    const th=Math.max(SIL, noise*2.5);
+    if(rms>=th){ buf.push(blk); sp+=dt; sil=0; } else if(buf.length){ buf.push(blk); sil+=dt; if(sil>=PAUSE) flush(); }
     if(sp>=MAXSP) flush();
   };
   srcNode.connect(node); node.connect(ctx.destination);
   try{ wake=await navigator.wakeLock?.request("screen"); }catch(e){}
-  running=true; $("btnStart").textContent="듣기 정지"; $("btnStart").classList.add("on"); setStat("듣는 중",true);
+  running=true; lastSrc=""; $("btnStart").textContent="듣기 정지"; $("btnStart").classList.add("on"); setStat("듣는 중",true);
 }
 function stop(){
   node?.disconnect(); stream?.getTracks().forEach(t=>t.stop()); ctx?.close(); wake?.release?.();

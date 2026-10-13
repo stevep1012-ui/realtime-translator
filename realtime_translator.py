@@ -4,12 +4,13 @@
 설정은 같은 폴더의 .env 파일에서 읽음 (.env.example 참고)
 """
 import io
-import os
+import os, re
 import queue
 import sys
 import threading
 import time
 import wave
+from collections import deque
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,13 +36,41 @@ from openai import OpenAI
 
 INPUT_DEVICE = os.getenv("CAPTION_DEVICE", "BlackHole")  # 입력 장치 이름 일부
 SAMPLE_RATE = 16000
-MAX_CHUNK_SEC = float(os.getenv("CHUNK_SEC", "4"))   # 이 길이를 넘으면 무조건 전송
+# MODE=quality(기본): 문장 끝까지 기다렸다 상위 모델로 번역 / MODE=fast: 빠르지만 문장이 잘게 끊김
+MODE = os.getenv("MODE", "quality").strip().lower()
+_Q = MODE != "fast"
+MAX_CHUNK_SEC = float(os.getenv("CHUNK_SEC", "8" if _Q else "4"))      # 이 길이를 넘으면 무조건 전송
 MIN_SPEECH_SEC = 0.6    # 이보다 짧은 소리는 버림
-PAUSE_SEC = float(os.getenv("PAUSE_SEC", "0.35"))    # 이만큼 조용하면 문장 끝으로 보고 전송
+PAUSE_SEC = float(os.getenv("PAUSE_SEC", "0.6" if _Q else "0.35"))    # 이만큼 조용하면 문장 끝으로 보고 전송
+CONTEXT_N = int(os.getenv("CONTEXT_N", "6" if _Q else "3"))           # 번역할 때 참고할 직전 발화 수
+EXTRA_SAVE_LANGS = [x.strip() for x in os.getenv("EXTRA_SAVE_LANGS", "").split(",") if x.strip()]  # 종료 시 추가 저장할 언어. 예: 日本語,English
+# IT·통신 업계에서 외래어로 쓰는 용어는 그대로 (예: license → 허가 X, 라이센스 O). 사용자 GLOSSARY 가 우선
+TECH_GLOSSARY = ("license=라이센스, licensing=라이센싱, subscription=구독, server=서버, cloud=클라우드, "
+                 "on-premise=온프레미스, platform=플랫폼, solution=솔루션, deployment=구축, "
+                 "integration=연동, migration=마이그레이션, contact center=컨택센터, seat=시트, "
+                 "SIP trunk=SIP 트렁크, pipeline=파이프라인, partner=파트너, renewal=갱신")
+GLOSSARY = ", ".join(x for x in (os.getenv("GLOSSARY", "").strip(), TECH_GLOSSARY) if x)
+# 음성 인식이 제품명을 일반 단어로 잘못 듣는 경우 교정 (my collab → MiCollab 등)
+TERM_FIXES = [(re.compile(r"\b(?:my|mi|me)[\s-]?collab\b", re.I), "MiCollab"),
+              (re.compile(r"\bmy[\s-]?voice (business|connect|mx-?one)\b", re.I), lambda m: "MiVoice " + m.group(1).title().replace("Mx-One", "MX-ONE").replace("Mxone", "MX-ONE")),
+              (re.compile(r"\b(?:my|mi)[\s-]?contact center\b", re.I), "MiContact Center"),
+              (re.compile(r"\bmi[\s-]?cloud\b", re.I), "MiCloud"),
+              (re.compile(r"\bmy[\s-]tel\b", re.I), "Mitel")]
+def fix_terms(t):
+    for pat, rep in TERM_FIXES:
+        t = pat.sub(rep, t)
+    return t
+
+# 번역하지 않고 영어 그대로 둘 제품·회사명. 음성 인식에도 힌트로 전달해 철자를 맞춤
+PRODUCT_TERMS = ", ".join(x for x in (os.getenv("PRODUCT_TERMS", "").strip(),
+    "Mitel, MiCollab, MiVoice Business, MiVoice Connect, MiVoice MX-ONE, MX-ONE, MiContact Center, "
+    "MiCloud, CloudLink, OpenScape, Unify, Microsoft Teams, Zoom, Webex, Avaya, Genesys, Five9") if x)
 BLOCK_SEC = 0.05        # 소리 크기 판정 단위
-SILENCE_RMS = 0.005     # 이보다 조용하면 무음
+SILENCE_RMS = float(os.getenv("SILENCE_RMS", "0.005"))       # 스피커: 이보다 조용하면 무음
+MIC_SILENCE_RMS = float(os.getenv("MIC_SILENCE_RMS", "0.0012"))  # 마이크: 내장 마이크는 소리가 작아 기준을 낮춤
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
-TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", "claude-haiku-4-5")
+TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", "claude-sonnet-5" if _Q else "claude-haiku-4-5")
+FALLBACK_MODEL = "claude-haiku-4-5"
 SOURCE_LANG = os.getenv("SOURCE_LANG", "").strip()    # STT 언어 코드. 빈값 = 자동 감지(영어·일본어 등)
 TARGET_LANG = os.getenv("TARGET_LANG", "한국어")       # 번역 목표 언어 (자연어 이름)
 REVERSE_LANG = os.getenv("REVERSE_LANG", "English")   # 화자가 이미 목표 언어로 말하면 이 언어로 번역 (빈값 = 그대로 표시)
@@ -126,6 +155,69 @@ if not (os.getenv("OPENAI_API_KEY") and os.getenv("ANTHROPIC_API_KEY")):
     TARGET_LANG = os.getenv("TARGET_LANG", "한국어")
     REVERSE_LANG = os.getenv("REVERSE_LANG", "English")
 
+LANG_CHOICES = ["한국어", "日本語", "English", "中文", "Español", "Français", "Deutsch"]
+
+
+def set_env(key: str, val: str):
+    """.env 의 한 항목만 바꾼다 (다른 줄·API 키는 그대로)."""
+    path = os.path.join(HERE, ".env")
+    lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
+    for i, line in enumerate(lines):
+        if line.split("=", 1)[0].strip() == key:
+            lines[i] = f"{key}={val}"
+            break
+    else:
+        lines.append(f"{key}={val}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def choose_language():
+    """시작할 때 자막 언어를 고르는 창. Enter = 지난번 설정으로 바로 시작."""
+    global TARGET_LANG, REVERSE_LANG
+    from tkinter import ttk
+    win = tk.Tk()
+    win.title("실시간번역기 - 언어 선택")
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    pad = {"padx": 14, "pady": 6}
+    tk.Label(win, text="자막 언어 (상대방 말을 이 언어로 보여줌)").grid(row=0, column=0, sticky="w", **pad)
+    tgt = ttk.Combobox(win, values=LANG_CHOICES, width=18)
+    tgt.set(TARGET_LANG)
+    tgt.grid(row=0, column=1, **pad)
+    tk.Label(win, text="자막 언어로 말할 때는 이 언어로").grid(row=1, column=0, sticky="w", **pad)
+    rev = ttk.Combobox(win, values=["(번역 안 함)"] + LANG_CHOICES, width=18)
+    rev.set(REVERSE_LANG or "(번역 안 함)")
+    rev.grid(row=1, column=1, **pad)
+    tk.Label(win, text="목록에 없으면 직접 입력 가능 (예: Tiếng Việt)", fg="gray"
+             ).grid(row=2, column=0, columnspan=2, sticky="w", padx=14)
+    started = {"ok": False}
+
+    def start(_=None):
+        global TARGET_LANG, REVERSE_LANG
+        t = tgt.get().strip() or TARGET_LANG
+        r = rev.get().strip()
+        r = "" if r in ("", "(번역 안 함)") else r
+        TARGET_LANG, REVERSE_LANG = t, r
+        set_env("TARGET_LANG", t)          # 다음 실행 때 기본값으로
+        set_env("REVERSE_LANG", r)
+        started["ok"] = True
+        win.destroy()
+
+    tk.Button(win, text="시작 (Enter)", command=start, width=16
+              ).grid(row=3, column=0, columnspan=2, pady=(10, 14))
+    win.bind("<Return>", start)
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.after(100, lambda: (win.lift(), win.focus_force()))
+    win.mainloop()
+    if not started["ok"]:
+        raise SystemExit("언어 선택이 취소되었습니다.")
+    print(f"[언어] 자막={TARGET_LANG}  역방향={REVERSE_LANG or '없음'}", flush=True)
+
+
+if os.getenv("ASK_LANG", "1") != "0":
+    choose_language()
+
 openai_client = OpenAI()      # OPENAI_API_KEY
 claude = Anthropic()          # ANTHROPIC_API_KEY
 audio_q: queue.Queue[np.ndarray] = queue.Queue()
@@ -133,8 +225,9 @@ stt_q: queue.Queue[tuple[int, str]] = queue.Queue()      # (id, 영어)
 text_q: queue.Queue[tuple[int, str]] = queue.Queue()     # (id, 표시문)
 
 
-def make_vad(tag=""):
+def make_vad(tag="", threshold=None):
     """16kHz 모노 블록을 받아, 말이 끊기는 지점에서 발화 단위로 audio_q에 넣는 함수 반환. tag 는 화자 표시."""
+    th = SILENCE_RMS if threshold is None else threshold
     buf = []            # 현재 발화 (말 시작 후 누적)
     speech_sec = 0.0
     silence_sec = 0.0
@@ -147,7 +240,7 @@ def make_vad(tag=""):
 
     def feed(block: np.ndarray):
         nonlocal speech_sec, silence_sec
-        loud = float(np.sqrt(np.mean(block ** 2))) >= SILENCE_RMS
+        loud = float(np.sqrt(np.mean(block ** 2))) >= th
         if loud:
             buf.append(block)
             speech_sec += BLOCK_SEC
@@ -175,7 +268,7 @@ def capture_mac():
         raise RuntimeError(f"입력 장치 '{INPUT_DEVICE}' 없음. BlackHole 설치·설정 확인")
     print(f"[capture] device={dev} {sd.query_devices(dev)['name']}", flush=True)
     feed_spk = make_vad()
-    feed_mic = make_vad("(나) ")
+    feed_mic = make_vad("(나) ", MIC_SILENCE_RMS)
     bs = int(SAMPLE_RATE * BLOCK_SEC)
     streams = [sd.InputStream(device=dev, samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                               blocksize=bs, callback=lambda d, n, t, s: feed_spk(d[:, 0].copy()))]
@@ -222,7 +315,7 @@ def capture_windows():
         try:
             mic = p.get_default_input_device_info()
             print(f"[capture] mic {mic['name']}", flush=True)
-            open_stream(mic, make_vad("(나) "))
+            open_stream(mic, make_vad("(나) ", MIC_SILENCE_RMS))
         except Exception as e:
             print(f"[capture] 마이크 사용 불가: {e}", flush=True)
     threading.Event().wait()
@@ -246,24 +339,49 @@ def to_wav_bytes(samples: np.ndarray) -> bytes:
 
 def transcribe(samples: np.ndarray) -> str:
     kwargs = {"language": SOURCE_LANG} if SOURCE_LANG else {}
+    kwargs["prompt"] = f"Business meeting about enterprise communications. Terms: {PRODUCT_TERMS}."
     r = openai_client.audio.transcriptions.create(
         model=STT_MODEL, file=to_wav_bytes(samples), **kwargs)
-    return r.text.strip()
+    return fix_terms(r.text.strip())
 
 
-def translate_stream(en: str, prev: str):
+def build_system(history) -> str:
+    rev = (f"If the new line is already in {TARGET_LANG}, translate it into {REVERSE_LANG} instead. "
+           if REVERSE_LANG else f"If the new line is already in {TARGET_LANG}, output it unchanged. ")
+    ctx = "\n".join(f"- {src}  =>  {tgt}" for src, tgt in history) or "(none)"
+    gl = f"\nGlossary (always use these renderings): {GLOSSARY}" if GLOSSARY else ""
+    return ("You are a professional simultaneous interpreter subtitling a live business meeting into "
+            f"{TARGET_LANG}. " + rev +
+            "The new line comes from speech recognition and may be a fragment of a longer sentence: "
+            "use the recent conversation to resolve meaning, pronouns and terminology, and keep wording "
+            "consistent with earlier translations. Translate meaning, not word-for-word; use natural spoken "
+            f"business {TARGET_LANG}. Keep names, product names, numbers and units exact. "
+            "For IT/telecom/enterprise-software terms, use the loanword professionals actually say "
+            "(e.g. in Korean: license → 라이센스, not 허가), not a literal dictionary word. "
+            f"Never translate or transliterate these product/company names, write them exactly in English: {PRODUCT_TERMS}. "
+            "Output only the translation of the new line, no notes or quotes."
+            f"\n\nRecent conversation (source => translation):\n{ctx}{gl}")
+
+
+def translate_stream(en: str, history):
     """번역문을 글자가 나오는 대로 yield (누적 문자열)."""
+    global TRANSLATE_MODEL
     acc = ""
-    with claude.messages.stream(
-            model=TRANSLATE_MODEL, max_tokens=300,
-            system=f"Translate meeting speech (any language) into natural {TARGET_LANG} subtitles. "
-                   + (f"If the text is already {TARGET_LANG}, translate it into {REVERSE_LANG} instead. "
-                      if REVERSE_LANG else f"If the text is already {TARGET_LANG}, return it unchanged. ")
-                   + f"Output only the translation. Previous context: {prev}",
-            messages=[{"role": "user", "content": en}]) as s:
-        for piece in s.text_stream:
-            acc += piece
-            yield acc
+    try:
+        with claude.messages.stream(
+                model=TRANSLATE_MODEL, max_tokens=400, system=build_system(history),
+                messages=[{"role": "user", "content": en}]) as s:
+            for piece in s.text_stream:
+                acc += piece
+                yield acc
+    except Exception as e:
+        # 계정에서 상위 모델을 못 쓰면 빠른 모델로 자동 전환
+        if TRANSLATE_MODEL != FALLBACK_MODEL and not acc and "model" in str(e).lower():
+            print(f"[번역] {TRANSLATE_MODEL} 사용 불가 → {FALLBACK_MODEL} 로 전환", flush=True)
+            TRANSLATE_MODEL = FALLBACK_MODEL
+            yield from translate_stream(en, history)
+        else:
+            raise
 
 
 def stt_worker():
@@ -285,19 +403,19 @@ def stt_worker():
 
 
 def translate_worker():
-    prev = ""
+    history = deque(maxlen=CONTEXT_N)   # (원문, 번역) 최근 발화
     while True:
         seq, en, tag, t0 = stt_q.get()
         try:
             ko = ""
             first = None
-            for ko in translate_stream(en, prev):
+            for ko in translate_stream(en, list(history)):
                 if first is None:
                     first = time.time() - t0
                 text_q.put((seq, tag + ko, tag + en))   # 부분 번역을 계속 갱신
             print(f"[ko {seq}] 첫글자 {first:.2f}s 완료 {time.time()-t0:.2f}s  {ko}",
                   flush=True)
-            prev = en
+            history.append((en, ko))
         except Exception as e:
             print(f"[번역 오류] {e!r}", flush=True)
             text_q.put((seq, f"[번역 오류] {e}", tag + en))
@@ -321,6 +439,7 @@ def ui():
     box.pack(fill="both", expand=True)
     lines: dict[int, tuple[str, str]] = {}   # seq → (번역, 원문), 삽입 순서 유지
     history: dict[int, str] = {}
+    sources: dict[int, tuple[str, str]] = {}   # seq → (시각, 원문)  추가 언어 저장용
     err_seq = 0
     save_path = os.path.join(SAVE_DIR, f"실시간번역기_{datetime.now():%Y%m%d_%H%M}.txt")
     dirty = False
@@ -356,17 +475,57 @@ def ui():
                 err_seq -= 1
                 seq = err_seq
             lines[seq] = (ko, en)
-            history[seq] = f"[{datetime.now():%H:%M:%S}] {ko}\n  ({en})"
+            ts = sources[seq][0] if seq in sources else f"{datetime.now():%H:%M:%S}"
+            if seq > 0 and en:
+                sources[seq] = (ts, en)
+            history[seq] = f"[{ts}] {ko}\n  ({en})"
             dirty = True
             for k in list(lines)[:-MAX_LINES]:
                 del lines[k]
             render()
         root.after(150, poll)
 
+    def save_extra_langs():
+        """회의 종료 후 전체 원문을 다른 언어로 한 번 더 번역해 별도 파일로 저장."""
+        items = [sources[k] for k in sorted(sources)]
+        if not items or not EXTRA_SAVE_LANGS:
+            return
+        for lang in EXTRA_SAVE_LANGS:
+            box.config(state="normal"); box.delete("1.0", "end")
+            box.insert("end", f"{lang} 번역본 저장 중… ({len(items)}문장)", "ko")
+            box.config(state="disabled"); root.update()
+            out = []
+            try:
+                for i in range(0, len(items), 40):           # 40문장씩 나눠 번역
+                    batch = items[i:i + 40]
+                    numbered = "\n".join(f"{n}. {src}" for n, (_, src) in enumerate(batch, 1))
+                    gl = f" Glossary: {GLOSSARY}." if GLOSSARY else ""
+                    msg = claude.messages.create(
+                        model=TRANSLATE_MODEL, max_tokens=8000,
+                        system=(f"Translate this numbered business-meeting transcript into natural {lang}. "
+                                "Lines are consecutive speech, use the surrounding lines for context. "
+                                "Keep the leading '(나)' speaker tag untranslated. Keep names and numbers exact."
+                                f"{gl} Output exactly one line per input line, as 'N. translation', nothing else."),
+                        messages=[{"role": "user", "content": numbered}])
+                    got = {}
+                    for line in msg.content[0].text.splitlines():
+                        num, _, txt = line.partition(". ")
+                        if num.strip().isdigit():
+                            got[int(num)] = txt.strip()
+                    for n, (ts, src) in enumerate(batch, 1):
+                        out.append(f"[{ts}] {got.get(n, '(번역 누락)')}\n  ({src})")
+                path = save_path[:-4] + f"_{lang}.txt"
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(out) + "\n")
+                print(f"[saved] {path}", flush=True)
+            except Exception as e:
+                print(f"[{lang} 저장 오류] {e!r}", flush=True)
+
     def on_close():
         save()
         if history:
             print(f"[saved] {save_path}", flush=True)
+        save_extra_langs()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)

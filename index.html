@@ -144,7 +144,9 @@ async function transcribe(wav){
   let r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd});
   if(r.status===404||r.status===400){ fd.set("model","whisper-1"); r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd}); }
   if(!r.ok) throw new Error("음성 인식 "+r.status+" (OpenAI 키·크레딧 확인)");
-  return fixTerms((await r.json()).text.trim());
+  const t=(await r.json()).text.trim();
+  if(/Business meeting about enterprise|Terms: Mitel|MiVoice Connect, MiVoice MX-ONE/.test(t)) return "";  // 불분명한 소리에 힌트 문장이 그대로 나오는 경우 버림
+  return fixTerms(t);
 }
 const hist=[];  // 최근 (원문, 번역)
 const Q=()=>cfg.mode!=="fast";

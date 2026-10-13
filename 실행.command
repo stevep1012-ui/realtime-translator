@@ -16,7 +16,7 @@ if ! command -v brew >/dev/null; then
 fi
 
 # 1b. Xcode 가 설치된 Mac 은 라이선스 동의가 안 돼 있으면 brew 가 멈춤
-if xcode-select -p >/dev/null 2>&1 && ! xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
+if xcode-select -p 2>/dev/null | grep -q Xcode.app && ! xcodebuild -license check >/dev/null 2>&1; then
   step "Xcode 라이선스 동의 (Mac 암호 입력)"
   sudo xcodebuild -license accept || fail "Xcode 라이선스 동의 실패. 터미널에서 'sudo xcodebuild -license accept' 실행 후 다시 시도"
 fi
@@ -27,6 +27,7 @@ if ! brew list python-tk >/dev/null 2>&1; then
   brew install python python-tk || fail "Python 설치 실패"
 fi
 PY="$(brew --prefix)/bin/python3"
+
 
 # 3. BlackHole (시스템 소리 캡처용 가상 장치)
 if ! [ -e /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver ]; then
@@ -42,6 +43,14 @@ if [ ! -d .venv ]; then
   "$PY" -m venv .venv || fail "venv 생성 실패"
   .venv/bin/pip install -q --upgrade pip
   .venv/bin/pip install -q sounddevice numpy openai anthropic || fail "패키지 설치 실패"
+fi
+
+# 4b. Homebrew 업데이트로 Tk 가 깨지면 (libtcl 없음) 가상환경의 Python 버전에 맞춰 자동 재설치
+if ! .venv/bin/python -c "import tkinter" >/dev/null 2>&1; then
+  VER=$(.venv/bin/python -c 'import sys;print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+  step "Tk 라이브러리 복구 (python-tk@$VER, 1~2분)"
+  brew reinstall tcl-tk "python-tk@$VER" || fail "Tk 복구 실패. 터미널에서 'brew reinstall tcl-tk python-tk@$VER' 실행 후 다시 시도"
+  .venv/bin/python -c "import tkinter" >/dev/null 2>&1 || fail "Tk 복구 후에도 실패. 폴더의 .venv 를 지우고 다시 실행하세요 (rm -rf .venv)"
 fi
 
 # 5. 다중 출력 장치 확인 (스피커 + BlackHole 동시 출력)

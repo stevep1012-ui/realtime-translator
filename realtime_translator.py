@@ -337,12 +337,19 @@ def to_wav_bytes(samples: np.ndarray) -> bytes:
     return bio
 
 
+STT_HINT = f"Business meeting about enterprise communications. Terms: {PRODUCT_TERMS}."
+
+
 def transcribe(samples: np.ndarray) -> str:
     kwargs = {"language": SOURCE_LANG} if SOURCE_LANG else {}
-    kwargs["prompt"] = f"Business meeting about enterprise communications. Terms: {PRODUCT_TERMS}."
+    kwargs["prompt"] = STT_HINT
     r = openai_client.audio.transcriptions.create(
         model=STT_MODEL, file=to_wav_bytes(samples), **kwargs)
-    return fix_terms(r.text.strip())
+    t = r.text.strip()
+    # 소리가 불분명하면 STT 가 힌트 문장을 그대로 돌려줌 → 버림
+    if "Business meeting about enterprise" in t or "Terms: Mitel" in t or "MiVoice Connect, MiVoice MX-ONE" in t:
+        return ""
+    return fix_terms(t)
 
 
 def build_system(history) -> str:
@@ -413,7 +420,7 @@ def translate_worker():
                 if first is None:
                     first = time.time() - t0
                 text_q.put((seq, tag + ko, tag + en))   # 부분 번역을 계속 갱신
-            print(f"[ko {seq}] 첫글자 {first:.2f}s 완료 {time.time()-t0:.2f}s  {ko}",
+            print(f"[ko {seq}] 첫글자 {first or 0:.2f}s 완료 {time.time()-t0:.2f}s  {ko}",
                   flush=True)
             history.append((en, ko))
         except Exception as e:

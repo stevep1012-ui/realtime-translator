@@ -85,6 +85,8 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
   <div class="field"><label for="src">화자 언어</label><select id="src"><option value="">자동 감지 (영어·일본어 등 섞여도 됨)</option><option value="en">영어</option><option value="ja">일본어</option><option value="zh">중국어</option><option value="es">스페인어</option><option value="fr">프랑스어</option><option value="de">독일어</option><option value="ko">한국어</option></select></div>
   <div class="field"><label for="tgt">자막 언어</label><input id="tgt" value="한국어"></div>
   <div class="field"><label for="rev">자막 언어로 말할 때 번역할 언어 (비우면 번역 안 함)</label><input id="rev" value="English"></div>
+  <div class="field"><label for="mode">번역 방식</label><select id="mode"><option value="quality">품질 우선 (문장 끝까지 듣고 번역, 3~4초)</option><option value="fast">속도 우선 (1~2초, 문장이 잘게 끊김)</option></select></div>
+  <div class="field"><label for="gloss">용어집 (선택, 쉼표로 구분)</label><input id="gloss" placeholder="Mitel=마이텔, AICC=AI 컨택센터"></div>
   <div class="err" id="err"></div>
   <div class="hint" id="keyState"></div>
   <div class="row"><button class="big" id="btnSaveSettings" type="button">저장</button><button class="icon" id="btnCloseSettings" type="button">닫기</button></div>
@@ -100,7 +102,7 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
 <script>
 (() => {
 const $ = id => document.getElementById(id);
-const cfg = {okey:"", akey:"", src:"", tgt:"한국어", rev:"English"};
+const cfg = {okey:"", akey:"", src:"", tgt:"한국어", rev:"English", mode:"quality", gloss:""};
 const store = {
   load(){ try{ Object.assign(cfg, JSON.parse(localStorage.getItem("rt_cfg")||"{}")); }catch(e){} },
   save(){ try{ localStorage.setItem("rt_cfg", JSON.stringify(cfg)); }catch(e){}
@@ -109,7 +111,7 @@ const store = {
 store.load();
 
 // ---------- 설정 ----------
-function openSettings(){ $("okey").value=cfg.okey; $("akey").value=cfg.akey; $("src").value=cfg.src; $("tgt").value=cfg.tgt; $("rev").value=cfg.rev; $("err").textContent=""; $("keyState").textContent=cfg.okey&&cfg.akey?"✓ 키가 이 기기에 저장돼 있습니다":""; $("settings").hidden=false; }
+function openSettings(){ $("okey").value=cfg.okey; $("akey").value=cfg.akey; $("src").value=cfg.src; $("tgt").value=cfg.tgt; $("rev").value=cfg.rev; $("mode").value=cfg.mode; $("gloss").value=cfg.gloss; $("err").textContent=""; $("keyState").textContent=cfg.okey&&cfg.akey?"✓ 키가 이 기기에 저장돼 있습니다":""; $("settings").hidden=false; }
 $("btnSettings").onclick = openSettings;
 $("btnCloseSettings").onclick = () => { $("settings").hidden = true; };
 $("btnSaveSettings").onclick = () => {
@@ -117,7 +119,7 @@ $("btnSaveSettings").onclick = () => {
   if(!o.startsWith("sk-")) return $("err").textContent="OpenAI 키는 sk- 로 시작합니다";
   if(!a.startsWith("sk-ant-")) return $("err").textContent="Anthropic 키는 sk-ant- 로 시작합니다";
   if(!t) return $("err").textContent="자막 언어를 입력하세요";
-  Object.assign(cfg,{okey:o,akey:a,src:$("src").value,tgt:t,rev:$("rev").value.trim()}); store.save(); $("settings").hidden=true;
+  Object.assign(cfg,{okey:o,akey:a,src:$("src").value,tgt:t,rev:$("rev").value.trim(),mode:$("mode").value,gloss:$("gloss").value.trim()}); store.save(); $("settings").hidden=true;
 };
 if(!cfg.okey||!cfg.akey) openSettings();
 
@@ -138,25 +140,41 @@ function setStat(text, live){ $("stat").textContent=text; $("dot").classList.tog
 async function transcribe(wav){
   const fd=new FormData(); fd.append("file",wav,"chunk.wav"); fd.append("model","gpt-4o-mini-transcribe");
   if(cfg.src) fd.append("language",cfg.src);
+  fd.append("prompt","Business meeting about enterprise communications. Terms: "+PRODUCT_TERMS+".");
   let r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd});
   if(r.status===404||r.status===400){ fd.set("model","whisper-1"); r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd}); }
   if(!r.ok) throw new Error("음성 인식 "+r.status+" (OpenAI 키·크레딧 확인)");
-  return (await r.json()).text.trim();
+  return fixTerms((await r.json()).text.trim());
 }
-let prev="";
+const hist=[];  // 최근 (원문, 번역)
+const Q=()=>cfg.mode!=="fast";
+const PRODUCT_TERMS="Mitel, MiCollab, MiVoice Business, MiVoice Connect, MiVoice MX-ONE, MX-ONE, MiContact Center, MiCloud, CloudLink, OpenScape, Unify, Microsoft Teams, Zoom, Webex, Avaya, Genesys, Five9";
+const TERM_FIXES=[[/\b(?:my|mi|me)[\s-]?collab\b/gi,"MiCollab"],[/\b(?:my|mi)[\s-]?contact center\b/gi,"MiContact Center"],[/\bmi[\s-]?cloud\b/gi,"MiCloud"],[/\bmy[\s-]?voice (business|connect)\b/gi,(_,x)=>"MiVoice "+x[0].toUpperCase()+x.slice(1).toLowerCase()],[/\bmy[\s-]tel\b/gi,"Mitel"]];
+function fixTerms(t){ for(const [p,r] of TERM_FIXES) t=t.replace(p,r); return t; }
+const TECH_GLOSSARY="license=라이센스, licensing=라이센싱, subscription=구독, server=서버, cloud=클라우드, on-premise=온프레미스, platform=플랫폼, solution=솔루션, deployment=구축, integration=연동, migration=마이그레이션, contact center=컨택센터, seat=시트, SIP trunk=SIP 트렁크, pipeline=파이프라인, partner=파트너, renewal=갱신";
+function sysPrompt(){
+  const rev=cfg.rev?`If the new line is already in ${cfg.tgt}, translate it into ${cfg.rev} instead. `:`If the new line is already in ${cfg.tgt}, output it unchanged. `;
+  const ctx=hist.map(([a,b])=>`- ${a}  =>  ${b}`).join("\n")||"(none)";
+  return `You are a professional simultaneous interpreter subtitling a live business meeting into ${cfg.tgt}. ${rev}`+
+    `The new line comes from speech recognition and may be a fragment of a longer sentence: use the recent conversation to resolve meaning, pronouns and terminology, and keep wording consistent with earlier translations. `+
+    `Translate meaning, not word-for-word; use natural spoken business ${cfg.tgt}. Keep names, product names, numbers and units exact. For IT/telecom/enterprise-software terms, use the loanword professionals actually say (e.g. in Korean: license → 라이센스, not 허가), not a literal dictionary word. Never translate or transliterate these product/company names, write them exactly in English: ${PRODUCT_TERMS}. Output only the translation of the new line, no notes or quotes.`+
+    `\n\nRecent conversation (source => translation):\n${ctx}`+`\nGlossary (always use these renderings): ${[cfg.gloss,TECH_GLOSSARY].filter(Boolean).join(", ")}`;
+}
+let modelOverride=null;
 async function translateStream(text,onText){
   const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
     "content-type":"application/json","x-api-key":cfg.akey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-    body:JSON.stringify({model:"claude-haiku-4-5",max_tokens:300,stream:true,
-      system:`Translate meeting speech (any language) into natural ${cfg.tgt} subtitles. ${cfg.rev ? `If the text is already ${cfg.tgt}, translate it into ${cfg.rev} instead.` : `If the text is already ${cfg.tgt}, return it unchanged.`} Output only the translation. Previous context: ${prev}`,
+    body:JSON.stringify({model:modelOverride||(Q()?"claude-sonnet-5":"claude-haiku-4-5"),max_tokens:400,stream:true,
+      system:sysPrompt(),
       messages:[{role:"user",content:text}]})});
+  if((r.status===404||r.status===400)&&!modelOverride&&Q()){ modelOverride="claude-haiku-4-5"; return translateStream(text,onText); }  // 상위 모델 사용 불가 시 자동 전환
   if(!r.ok) throw new Error("번역 "+r.status+" (Anthropic 키·크레딧 확인)");
   const rd=r.body.getReader(), dec=new TextDecoder(); let buf="", acc="";
   for(;;){ const {value,done}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true});
     const lines=buf.split("\n"); buf=lines.pop();
     for(const l of lines){ if(!l.startsWith("data:")) continue; try{ const j=JSON.parse(l.slice(5));
       if(j.type==="content_block_delta"&&j.delta?.text){ acc+=j.delta.text; onText(acc); } }catch(e){} } }
-  prev=text; return acc;
+  hist.push([text,acc]); while(hist.length>(Q()?6:3)) hist.shift(); return acc;
 }
 const queue=[]; let busy=false;
 async function pump(){
@@ -174,7 +192,7 @@ async function pump(){
 }
 
 // ---------- 마이크 + 발화 분할 ----------
-const RATE=16000, PAUSE=0.35, MINSP=0.6, MAXSP=4, SIL=0.006;
+const RATE=16000, MINSP=0.6, SIL=0.006;
 let ctx, stream, node, wake, running=false;
 function toWav(f32){
   const b=new ArrayBuffer(44+f32.length*2), v=new DataView(b);
@@ -190,7 +208,7 @@ async function start(){
   }catch(e){ setStat("마이크 권한 필요"); alert("마이크 사용을 허용해 주세요. 허용 창이 안 뜨면 이 페이지를 Safari/Chrome 에서 직접 여세요."); return; }
   ctx=new (window.AudioContext||window.webkitAudioContext)(); await ctx.resume();
   const srcNode=ctx.createMediaStreamSource(stream); node=ctx.createScriptProcessor(4096,1,1);
-  const ratio=ctx.sampleRate/RATE; let buf=[], sp=0, sil=0;
+  const ratio=ctx.sampleRate/RATE; let buf=[], sp=0, sil=0; const PAUSE=Q()?0.6:0.35, MAXSP=Q()?8:4;
   const flush=()=>{ if(sp>=MINSP){ const n=buf.reduce((a,b)=>a+b.length,0), out=new Float32Array(n); let o=0; for(const b of buf){out.set(b,o);o+=b.length;} queue.push(toWav(out)); pump(); } buf=[]; sp=0; sil=0; };
   node.onaudioprocess=e=>{
     const inp=e.inputBuffer.getChannelData(0); const n=Math.floor(inp.length/ratio); const blk=new Float32Array(n);

@@ -276,7 +276,8 @@ $("btnStart").onclick=()=>{ if(!cfg.okey||!cfg.akey) return openSettings(); runn
 // ---------- 항상 위에 떠 있는 자막창 (Chrome·Edge) ----------
 $("btnPip").onclick=async()=>{
   if(window.documentPictureInPicture.window) return window.documentPictureInPicture.window.close();
-  const w=await documentPictureInPicture.requestWindow({width:720,height:230});
+  let w; try{ w=await documentPictureInPicture.requestWindow({width:720,height:230}); }
+  catch(e){ alert("이 브라우저에서는 떠 있는 자막창을 열 수 없습니다. Chrome 또는 Edge 최신 버전으로 이 페이지를 열어 주세요."); return; }
   document.querySelectorAll("style,link[rel=stylesheet]").forEach(n=>w.document.head.appendChild(n.cloneNode(true)));
   w.document.body.className="pip"; w.document.body.appendChild(feed); feed.scrollTop=feed.scrollHeight;
   $("btnPip").textContent="자막창 닫기";

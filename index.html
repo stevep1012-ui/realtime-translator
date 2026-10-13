@@ -143,7 +143,7 @@ async function transcribe(wav){
   fd.append("prompt","Business meeting about enterprise communications. Terms: "+PRODUCT_TERMS+".");
   let r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd});
   if(r.status===404||r.status===400){ fd.set("model","whisper-1"); r=await fetch("https://api.openai.com/v1/audio/transcriptions",{method:"POST",headers:{Authorization:"Bearer "+cfg.okey},body:fd}); }
-  if(!r.ok) throw new Error("음성 인식 "+r.status+" (OpenAI 키·크레딧 확인)");
+  if(!r.ok) throw new Error("음성 인식 "+(await apiError(r)));
   const t=(await r.json()).text.trim();
   if(/Business meeting about enterprise|Terms: Mitel|MiVoice Connect, MiVoice MX-ONE/.test(t)) return "";  // 불분명한 소리에 힌트 문장이 그대로 나오는 경우 버림
   return fixTerms(t);
@@ -162,15 +162,22 @@ function sysPrompt(){
     `Translate meaning, not word-for-word; use natural spoken business ${cfg.tgt}. Keep names, product names, numbers and units exact. For IT/telecom/enterprise-software terms, use the loanword professionals actually say (e.g. in Korean: license → 라이센스, not 허가), not a literal dictionary word. Never translate or transliterate these product/company names, write them exactly in English: ${PRODUCT_TERMS}. Output only the translation of the new line, no notes or quotes.`+
     `\n\nRecent conversation (source => translation):\n${ctx}`+`\nGlossary (always use these renderings): ${[cfg.gloss,TECH_GLOSSARY].filter(Boolean).join(", ")}`;
 }
-let modelOverride=null;
+// 앞에서부터 시도해 계정에서 쓸 수 있는 첫 모델을 기억
+const MODELS={quality:["claude-sonnet-5-5","claude-sonnet-5","claude-haiku-4-5-20251001","claude-haiku-4-5"],
+              fast:["claude-haiku-4-5-20251001","claude-haiku-4-5"]};
+const goodModel={};
+async function apiError(r){ try{ const j=await r.json(); return r.status+" "+(j.error?.message||""); }catch(e){ return String(r.status); } }
 async function translateStream(text,onText){
-  const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
-    "content-type":"application/json","x-api-key":cfg.akey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-    body:JSON.stringify({model:modelOverride||(Q()?"claude-sonnet-5":"claude-haiku-4-5"),max_tokens:400,stream:true,
-      system:sysPrompt(),
-      messages:[{role:"user",content:text}]})});
-  if((r.status===404||r.status===400)&&!modelOverride&&Q()){ modelOverride="claude-haiku-4-5"; return translateStream(text,onText); }  // 상위 모델 사용 불가 시 자동 전환
-  if(!r.ok) throw new Error("번역 "+r.status+" (Anthropic 키·크레딧 확인)");
+  const mode=Q()?"quality":"fast"; let r, err="";
+  for(const model of goodModel[mode]?[goodModel[mode]]:MODELS[mode]){
+    r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
+      "content-type":"application/json","x-api-key":cfg.akey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+      body:JSON.stringify({model,max_tokens:400,stream:true,system:sysPrompt(),messages:[{role:"user",content:text}]})});
+    if(r.ok){ goodModel[mode]=model; break; }
+    err=await apiError(r);
+    if(r.status!==404&&r.status!==400) break;   // 모델 문제가 아니면 다른 모델 시도 안 함
+  }
+  if(!r.ok) throw new Error("번역 "+err);
   const rd=r.body.getReader(), dec=new TextDecoder(); let buf="", acc="";
   for(;;){ const {value,done}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true});
     const lines=buf.split("\n"); buf=lines.pop();

@@ -47,10 +47,17 @@ Teams·Zoom·YouTube 등 컴퓨터 스피커로 나오는 말을 인식해 번�
 - Windows 는 기본 스피커 소리를 잡습니다. Teams 스피커를 헤드셋으로 바꾸면 Windows 기본 출력도 같은 장치로
 
 ## 언어 / 세부 설정
-폴더의 `.env` 파일을 메모장으로 열어 수정 (`.env.example` 에 항목 설명)
+실행할 때마다 **언어 선택 창**이 뜹니다 (자막 언어, 한국어로 말할 때 번역할 언어). 선택은 저장되고, 창을 끄려면 `.env` 에 `ASK_LANG=0`.
+
+그 밖의 설정은 폴더의 `.env` 파일을 메모장으로 열어 수정 (`.env.example` 에 항목 설명)
 ```
-SOURCE_LANG=          # 비우면 자동 감지. 한 언어로 고정: en, ja, zh, de, fr, es …
-TARGET_LANG=한국어     # 자막 언어
+SOURCE_LANG=              # 비우면 자동 감지. 한 언어로 고정: en, ja, zh, de, fr, es …
+TARGET_LANG=한국어         # 자막 언어
+MODE=quality              # quality = 정확(지연 3~4초) / fast = 빠름(1~2초)
+EXTRA_SAVE_LANGS=日本語    # 회의 종료 후 다른 언어로도 저장 (쉼표로 여러 개)
+GLOSSARY=AICC=AI 컨택센터  # 고정 번역 (license=라이센스 등 IT 용어는 내장)
+PRODUCT_TERMS=고객사명     # 번역하지 않고 영어 그대로 둘 이름 (Mitel, MiCollab 등은 내장)
+MIC_SILENCE_RMS=0.0012    # 내 말이 인식 안 되면 낮춤
 ```
 키를 다시 입력하려면 `.env` 를 지우고 실행하면 설정 창이 다시 뜹니다.
 

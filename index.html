@@ -55,6 +55,9 @@ button,input,select{font:inherit}
 .field a{color:var(--accent);font-size:13px}
 .row{display:flex;gap:10px;flex-wrap:wrap}
 .err{color:var(--live);font-size:13px;min-height:1.2em}
+.bar select.icon{padding:10px;max-width:200px}
+@media (min-width:900px){ .feed{padding:16px max(16px,calc(50% - 440px))} .cap .ko{font-size:22px} }
+body.pip{background:#000;color:#fff} body.pip .feed{padding:10px 14px} body.pip .cap{border-left-color:#444} body.pip .cap .ko{font-size:20px;color:#fff} body.pip .cap .src{color:#aaa} body.pip .cap .t{display:none}
 textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);font:13px/1.5 var(--mono);padding:10px}
 </style>
 </head>
@@ -67,13 +70,19 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
 </div>
 
 <div class="feed" id="feed">
-  <div class="hint">마이크로 주변 말을 듣고 번역 자막을 띄웁니다. 폰을 화자나 노트북 스피커 가까이 두세요.</div>
+  <div class="hint" id="hintText">마이크로 주변 말을 듣고 번역 자막을 띄웁니다. 폰을 화자나 노트북 스피커 가까이 두세요.</div>
   <div class="cap example"><div class="ko">다음 분기 예산은 3월 말까지 확정하겠습니다.</div><div class="src">We'll finalize next quarter's budget by the end of March.</div><div class="t">09:41:02</div></div>
   <div class="cap example"><div class="ko">그 부분은 일본 팀과 먼저 확인해 보겠습니다.</div><div class="src">その点はまず日本チームと確認してみます。</div><div class="t">09:41:10</div></div>
 </div>
 
 <div class="bar">
+  <select class="icon" id="srcSel" hidden aria-label="들을 소리">
+    <option value="both">회의 소리 + 내 마이크</option>
+    <option value="sys">회의 소리만</option>
+    <option value="mic">마이크만</option>
+  </select>
   <button class="big" id="btnStart" type="button">듣기 시작</button>
+  <button class="icon" id="btnPip" type="button" hidden>자막 띄우기</button>
   <button class="icon" id="btnSave" type="button">자막 저장</button>
 </div>
 
@@ -102,7 +111,7 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
 <script>
 (() => {
 const $ = id => document.getElementById(id);
-const cfg = {okey:"", akey:"", src:"", tgt:"한국어", rev:"English", mode:"quality", gloss:""};
+const cfg = {okey:"", akey:"", src:"", tgt:"한국어", rev:"English", mode:"quality", gloss:"", audio:"both"};
 const store = {
   load(){ try{ Object.assign(cfg, JSON.parse(localStorage.getItem("rt_cfg")||"{}")); }catch(e){} },
   save(){ try{ localStorage.setItem("rt_cfg", JSON.stringify(cfg)); }catch(e){}
@@ -125,19 +134,19 @@ if(!cfg.okey||!cfg.akey) openSettings();
 
 // ---------- 자막 표시 ----------
 const feed=$("feed"), history=[];
-function addCap(){
+function addCap(tag=""){
   const el=document.createElement("div"); el.className="cap pending";
   el.innerHTML='<div class="ko"></div><div class="src"></div><div class="t"></div>';
   feed.querySelectorAll(".example,.hint").forEach(x=>x.remove());
   feed.appendChild(el); feed.scrollTop=feed.scrollHeight;
-  const rec={ko:"",src:"",t:new Date().toTimeString().slice(0,8)}; history.push(rec);
+  const rec={ko:"",src:"",tag,t:new Date().toTimeString().slice(0,8)}; history.push(rec);
   el.querySelector(".t").textContent=rec.t;
   return {el,rec};
 }
 function setStat(text, live){ $("stat").textContent=text; $("dot").classList.toggle("live",!!live); }
 
 // ---------- API ----------
-async function transcribe(wav){
+async function transcribe(wav,tag=""){ const lastSrc=lastSrcBy[tag]||"";
   const fd=new FormData(); fd.append("file",wav,"chunk.wav"); fd.append("model","gpt-4o-mini-transcribe");
   if(cfg.src) fd.append("language",cfg.src);
   fd.append("prompt","Business meeting about enterprise communications. Terms: "+PRODUCT_TERMS+"."+(lastSrc?" Previous: "+lastSrc:""));
@@ -149,7 +158,7 @@ async function transcribe(wav){
   return fixTerms(t);
 }
 const hist=[];  // 최근 (원문, 번역)
-let lastSrc="";  // 직전 인식 문장 (다음 인식의 문맥 힌트)
+const lastSrcBy={};  // 화자별 직전 인식 문장 (다음 인식의 문맥 힌트)
 const Q=()=>cfg.mode!=="fast";
 const PRODUCT_TERMS="Mitel, MiCollab, MiVoice Business, MiVoice Connect, MiVoice MX-ONE, MX-ONE, MiContact Center, MiCloud, CloudLink, OpenScape, Unify, Microsoft Teams, Zoom, Webex, Avaya, Genesys, Five9";
 const TERM_FIXES=[[/\b(?:my|mi|me)[\s-]?collab\b/gi,"MiCollab"],[/\b(?:my|mi)[\s-]?contact center\b/gi,"MiContact Center"],[/\bmi[\s-]?cloud\b/gi,"MiCloud"],[/\bmy[\s-]?voice (business|connect)\b/gi,(_,x)=>"MiVoice "+x[0].toUpperCase()+x.slice(1).toLowerCase()],[/\bmy[\s-]tel\b/gi,"Mitel"]];
@@ -189,12 +198,12 @@ async function translateStream(text,onText){
 const queue=[]; let busy=false, tchain=Promise.resolve();
 async function pump(){
   if(busy) return; busy=true;
-  while(queue.length){ const wav=queue.shift(); const {el,rec}=addCap();
-    try{ const src=await transcribe(wav); if(!src){ el.remove(); history.pop(); continue; }
-      lastSrc=src.slice(-200);
-      rec.src=src; el.querySelector(".src").textContent=src;
+  while(queue.length){ const {wav,tag}=queue.shift(); const {el,rec}=addCap(tag);
+    try{ const src=await transcribe(wav,tag); if(!src){ el.remove(); history.pop(); continue; }
+      lastSrcBy[tag]=src.slice(-200);
+      rec.src=tag+src; el.querySelector(".src").textContent=tag+src;
       // 인식은 계속 진행, 번역은 순서대로 (직전 번역을 문맥으로 쓰기 위해)
-      tchain=tchain.then(()=>translateStream(src,t=>{ rec.ko=t; el.querySelector(".ko").textContent=t; feed.scrollTop=feed.scrollHeight; }))
+      tchain=tchain.then(()=>translateStream(src,t=>{ rec.ko=tag+t; el.querySelector(".ko").textContent=rec.ko; feed.scrollTop=feed.scrollHeight; }))
         .then(()=>el.classList.remove("pending"))
         .catch(e=>{ rec.ko="[오류] "+e.message; el.querySelector(".ko").textContent=rec.ko; el.classList.remove("pending"); });
     }catch(e){ rec.ko="[오류] "+e.message; el.querySelector(".ko").textContent=rec.ko; el.classList.remove("pending"); }
@@ -202,9 +211,14 @@ async function pump(){
   busy=false;
 }
 
-// ---------- 마이크 + 발화 분할 ----------
+// ---------- 소리 입력 + 발화 분할 ----------
 const RATE=16000, MINSP=0.6, SIL=0.006;
-let ctx, stream, node, wake, running=false;
+let ctx, streams=[], nodes=[], wake, running=false;
+// 노트북(화면 공유 가능한 브라우저)이면 회의 소리 선택 표시. 폰은 마이크만
+const CAN_SYS=!!navigator.mediaDevices?.getDisplayMedia && !/Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+if(CAN_SYS){ $("srcSel").hidden=false; $("srcSel").value=cfg.audio; $("srcSel").onchange=()=>{ cfg.audio=$("srcSel").value; store.save(); };
+  $("hintText").textContent="Teams·Zoom 소리와 내 마이크를 듣고 번역 자막을 띄웁니다. '듣기 시작' 후 공유 창에서 Windows 는 [전체 화면] + '시스템 오디오도 공유', Mac 은 Teams/Zoom 을 연 Chrome 탭 + '탭 오디오도 공유' 를 선택하세요. 내 말은 (나) 로 표시됩니다."; }
+if("documentPictureInPicture" in window) $("btnPip").hidden=false;
 function toWav(f32){
   const b=new ArrayBuffer(44+f32.length*2), v=new DataView(b);
   const s=(o,t)=>{for(let i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i));};
@@ -213,14 +227,11 @@ function toWav(f32){
   for(let i=0;i<f32.length;i++){const x=Math.max(-1,Math.min(1,f32[i]));v.setInt16(44+i*2,x<0?x*32768:x*32767,true);}
   return new Blob([b],{type:"audio/wav"});
 }
-async function start(){
-  try{
-    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:true,autoGainControl:true}});
-  }catch(e){ setStat("마이크 권한 필요"); alert("마이크 사용을 허용해 주세요. 허용 창이 안 뜨면 이 페이지를 Safari/Chrome 에서 직접 여세요."); return; }
-  ctx=new (window.AudioContext||window.webkitAudioContext)(); await ctx.resume();
-  const srcNode=ctx.createMediaStreamSource(stream); node=ctx.createScriptProcessor(4096,1,1);
+// 소리 하나(회의 소리 또는 마이크)를 받아 말이 끊기는 곳에서 잘라 queue 에 넣음. tag 는 화자 표시
+function listen(ms, tag){
+  const srcNode=ctx.createMediaStreamSource(ms), node=ctx.createScriptProcessor(4096,1,1); nodes.push(node,srcNode);
   const ratio=ctx.sampleRate/RATE; let buf=[], sp=0, sil=0, noise=SIL/2; const PAUSE=Q()?0.6:0.35, MAXSP=Q()?10:4;
-  const flush=()=>{ if(sp>=MINSP){ const n=buf.reduce((a,b)=>a+b.length,0), out=new Float32Array(n); let o=0; for(const b of buf){out.set(b,o);o+=b.length;} queue.push(toWav(out)); pump(); } buf=[]; sp=0; sil=0; };
+  const flush=()=>{ if(sp>=MINSP){ const n=buf.reduce((a,b)=>a+b.length,0), out=new Float32Array(n); let o=0; for(const b of buf){out.set(b,o);o+=b.length;} queue.push({wav:toWav(out),tag}); pump(); } buf=[]; sp=0; sil=0; };
   node.onaudioprocess=e=>{
     const inp=e.inputBuffer.getChannelData(0); const n=Math.floor(inp.length/ratio); const blk=new Float32Array(n);
     for(let i=0;i<n;i++){ const a=Math.floor(i*ratio), b=Math.min(inp.length,Math.floor((i+1)*ratio)); let acc=0; for(let k=a;k<b;k++) acc+=inp[k]; blk[i]=acc/Math.max(1,b-a); }  // 구간 평균으로 줄여 소리 뭉개짐 방지
@@ -231,14 +242,46 @@ async function start(){
     if(sp>=MAXSP) flush();
   };
   srcNode.connect(node); node.connect(ctx.destination);
+}
+async function start(){
+  const mode=CAN_SYS?cfg.audio:"mic"; streams=[]; nodes=[];
+  let sysAudio=null, mic=null;
+  if(mode!=="mic"){
+    try{
+      const ds=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},systemAudio:"include",selfBrowserSurface:"exclude"});
+      streams.push(ds);
+      if(!ds.getAudioTracks().length){ ds.getTracks().forEach(t=>t.stop()); streams=[];
+        setStat("소리 공유 안 됨"); alert("공유 창에서 소리 공유를 켜야 합니다.\nWindows: [전체 화면] 선택 + '시스템 오디오도 공유' 체크\nMac: Teams/Zoom 을 연 Chrome 탭 선택 + '탭 오디오도 공유' 체크"); return; }
+      ds.getVideoTracks().forEach(t=>t.enabled=false);   // 화면은 쓰지 않음
+      ds.getTracks().forEach(t=>t.addEventListener("ended",()=>{ if(running) stop(); }));  // 공유 중지 버튼을 누르면 같이 정지
+      sysAudio=new MediaStream(ds.getAudioTracks());
+    }catch(e){ setStat("공유 취소됨"); return; }
+  }
+  if(mode!=="sys"){
+    try{ mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:mode==="both",noiseSuppression:true,autoGainControl:true}}); streams.push(mic); }
+    catch(e){ if(!sysAudio){ setStat("마이크 권한 필요"); alert("마이크 사용을 허용해 주세요. 허용 창이 안 뜨면 이 페이지를 Safari/Chrome 에서 직접 여세요."); return; } }
+  }
+  ctx=new (window.AudioContext||window.webkitAudioContext)(); await ctx.resume();
+  if(sysAudio) listen(sysAudio,"");
+  if(mic) listen(mic, sysAudio?"(나) ":"");
   try{ wake=await navigator.wakeLock?.request("screen"); }catch(e){}
-  running=true; lastSrc=""; $("btnStart").textContent="듣기 정지"; $("btnStart").classList.add("on"); setStat("듣는 중",true);
+  running=true; for(const k in lastSrcBy) delete lastSrcBy[k]; $("btnStart").textContent="듣기 정지"; $("btnStart").classList.add("on"); $("srcSel").disabled=true; setStat("듣는 중",true);
 }
 function stop(){
-  node?.disconnect(); stream?.getTracks().forEach(t=>t.stop()); ctx?.close(); wake?.release?.();
-  running=false; $("btnStart").textContent="듣기 시작"; $("btnStart").classList.remove("on"); setStat("정지");
+  nodes.forEach(n=>n.disconnect()); streams.forEach(s=>s.getTracks().forEach(t=>t.stop())); ctx?.close(); wake?.release?.(); wake=null;
+  running=false; $("btnStart").textContent="듣기 시작"; $("btnStart").classList.remove("on"); $("srcSel").disabled=false; setStat("정지");
 }
 $("btnStart").onclick=()=>{ if(!cfg.okey||!cfg.akey) return openSettings(); running?stop():start(); };
+
+// ---------- 항상 위에 떠 있는 자막창 (Chrome·Edge) ----------
+$("btnPip").onclick=async()=>{
+  if(window.documentPictureInPicture.window) return window.documentPictureInPicture.window.close();
+  const w=await documentPictureInPicture.requestWindow({width:720,height:230});
+  document.querySelectorAll("style,link[rel=stylesheet]").forEach(n=>w.document.head.appendChild(n.cloneNode(true)));
+  w.document.body.className="pip"; w.document.body.appendChild(feed); feed.scrollTop=feed.scrollHeight;
+  $("btnPip").textContent="자막창 닫기";
+  w.addEventListener("pagehide",()=>{ document.body.insertBefore(feed,document.querySelector(".bar")); feed.scrollTop=feed.scrollHeight; $("btnPip").textContent="자막 띄우기"; });
+};
 document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible"&&running&&!wake) navigator.wakeLock?.request("screen").then(w=>wake=w).catch(()=>{}); });
 
 // ---------- 저장 / 공유 ----------
@@ -249,7 +292,7 @@ $("btnCopy").onclick=async()=>{ try{ await navigator.clipboard.writeText(exportT
 $("btnShare").onclick=async()=>{ const name=`실시간번역기_${new Date().toISOString().slice(0,16).replace(/[-:T]/g,"")}.txt`;
   try{ const f=new File([exportText()],name,{type:"text/plain"});
     if(navigator.canShare?.({files:[f]})) await navigator.share({files:[f],title:name}); else await navigator.share({title:name,text:exportText()});
-  }catch(e){ if(e.name!=="AbortError"){ $("exportText").select(); alert("공유가 안 되는 브라우저입니다. 아래 내용을 복사해 쓰세요."); } } };
+  }catch(e){ if(e.name!=="AbortError"){ const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([exportText()],{type:"text/plain"})); a.download=name; a.click(); } } };
 })();
 </script>
 

@@ -69,8 +69,10 @@ BLOCK_SEC = 0.05        # 소리 크기 판정 단위
 SILENCE_RMS = float(os.getenv("SILENCE_RMS", "0.005"))       # 스피커: 이보다 조용하면 무음
 MIC_SILENCE_RMS = float(os.getenv("MIC_SILENCE_RMS", "0.0012"))  # 마이크: 내장 마이크는 소리가 작아 기준을 낮춤
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
-TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", "claude-sonnet-5" if _Q else "claude-haiku-4-5")
-FALLBACK_MODEL = "claude-haiku-4-5"
+# 앞에서부터 시도해 계정에서 쓸 수 있는 첫 모델을 사용
+MODEL_CANDIDATES = ([os.getenv("TRANSLATE_MODEL")] if os.getenv("TRANSLATE_MODEL") else []) + (
+    ["claude-sonnet-5-5", "claude-sonnet-5"] if _Q else []) + ["claude-haiku-4-5-20251001", "claude-haiku-4-5"]
+TRANSLATE_MODEL = MODEL_CANDIDATES[0]
 SOURCE_LANG = os.getenv("SOURCE_LANG", "").strip()    # STT 언어 코드. 빈값 = 자동 감지(영어·일본어 등)
 TARGET_LANG = os.getenv("TARGET_LANG", "한국어")       # 번역 목표 언어 (자연어 이름)
 REVERSE_LANG = os.getenv("REVERSE_LANG", "English")   # 화자가 이미 목표 언어로 말하면 이 언어로 번역 (빈값 = 그대로 표시)
@@ -382,10 +384,11 @@ def translate_stream(en: str, history):
                 acc += piece
                 yield acc
     except Exception as e:
-        # 계정에서 상위 모델을 못 쓰면 빠른 모델로 자동 전환
-        if TRANSLATE_MODEL != FALLBACK_MODEL and not acc and "model" in str(e).lower():
-            print(f"[번역] {TRANSLATE_MODEL} 사용 불가 → {FALLBACK_MODEL} 로 전환", flush=True)
-            TRANSLATE_MODEL = FALLBACK_MODEL
+        # 계정에서 이 모델을 못 쓰면 다음 후보로 자동 전환
+        i = MODEL_CANDIDATES.index(TRANSLATE_MODEL)
+        if not acc and i + 1 < len(MODEL_CANDIDATES) and getattr(e, "status_code", None) in (400, 404):
+            print(f"[번역] {TRANSLATE_MODEL} 사용 불가 → {MODEL_CANDIDATES[i + 1]} 로 전환", flush=True)
+            TRANSLATE_MODEL = MODEL_CANDIDATES[i + 1]
             yield from translate_stream(en, history)
         else:
             raise

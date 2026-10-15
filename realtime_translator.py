@@ -42,7 +42,7 @@ _Q = MODE != "fast"
 MAX_CHUNK_SEC = float(os.getenv("CHUNK_SEC", "8" if _Q else "4"))      # 이 길이를 넘으면 무조건 전송
 MIN_SPEECH_SEC = 0.6    # 이보다 짧은 소리는 버림
 PAUSE_SEC = float(os.getenv("PAUSE_SEC", "0.6" if _Q else "0.35"))    # 이만큼 조용하면 문장 끝으로 보고 전송
-CONTEXT_N = int(os.getenv("CONTEXT_N", "6" if _Q else "3"))           # 번역할 때 참고할 직전 발화 수
+CONTEXT_N = int(os.getenv("CONTEXT_N", "4" if _Q else "2"))           # 번역할 때 참고할 직전 발화 수
 EXTRA_SAVE_LANGS = [x.strip() for x in os.getenv("EXTRA_SAVE_LANGS", "").split(",") if x.strip()]  # 종료 시 추가 저장할 언어. 예: 日本語,English
 # IT·통신 업계에서 외래어로 쓰는 용어는 그대로 (예: license → 허가 X, 라이센스 O). 사용자 GLOSSARY 가 우선
 TECH_GLOSSARY = ("license=라이센스, licensing=라이센싱, subscription=구독, server=서버, cloud=클라우드, "
@@ -354,11 +354,25 @@ def transcribe(samples: np.ndarray) -> str:
     return fix_terms(t)
 
 
-def build_system(history) -> str:
+def relevant(items: str, text: str) -> str:
+    """용어집·제품명 중 이번 문장(과 직전 문장)에 실제로 나온 것만 남겨 토큰 절약."""
+    t = text.lower()
+    return ", ".join(x.strip() for x in items.split(",")
+                     if x.strip() and x.split("=")[0].strip().lower() in t)
+
+
+# 맞장구·추임새는 번역 API 를 부르지 않고 그대로 표시
+FILLER = re.compile(r"^(?:(?:ok(?:ay)?|yeah|yes|yep|right|sure|uh-?huh|mm+|hmm+|um+|uh+|ah+|oh|"
+                    r"네|예|음+|아+|어+|그렇죠|맞아요|좋아요|はい|ええ|うん)[\s.,!?…]*)+$", re.I)
+
+
+def build_system(history, en="") -> str:
+    seen = en + " " + " ".join(src for src, _ in history)
+    gloss, prods = relevant(GLOSSARY, seen), relevant(PRODUCT_TERMS, seen)
     rev = (f"If the new line is already in {TARGET_LANG}, translate it into {REVERSE_LANG} instead. "
            if REVERSE_LANG else f"If the new line is already in {TARGET_LANG}, output it unchanged. ")
     ctx = "\n".join(f"- {src}  =>  {tgt}" for src, tgt in history) or "(none)"
-    gl = f"\nGlossary (always use these renderings): {GLOSSARY}" if GLOSSARY else ""
+    gl = f"\nGlossary (always use these renderings): {gloss}" if gloss else ""
     return ("You are a professional simultaneous interpreter subtitling a live business meeting into "
             f"{TARGET_LANG}. " + rev +
             "The new line comes from speech recognition and may be a fragment of a longer sentence: "
@@ -366,8 +380,8 @@ def build_system(history) -> str:
             "consistent with earlier translations. Translate meaning, not word-for-word; use natural spoken "
             f"business {TARGET_LANG}. Keep names, product names, numbers and units exact. "
             "For IT/telecom/enterprise-software terms, use the loanword professionals actually say "
-            "(e.g. in Korean: license → 라이센스, not 허가), not a literal dictionary word. "
-            f"Never translate or transliterate these product/company names, write them exactly in English: {PRODUCT_TERMS}. "
+            "(e.g. in Korean: license → 라이센스, not 허가), not a literal dictionary word. " +
+            (f"Never translate or transliterate these product/company names, write them exactly in English: {prods}. " if prods else "") +
             "Output only the translation of the new line, no notes or quotes."
             f"\n\nRecent conversation (source => translation):\n{ctx}{gl}")
 
@@ -378,7 +392,7 @@ def translate_stream(en: str, history):
     acc = ""
     try:
         with claude.messages.stream(
-                model=TRANSLATE_MODEL, max_tokens=400, system=build_system(history),
+                model=TRANSLATE_MODEL, max_tokens=400, system=build_system(history, en),
                 messages=[{"role": "user", "content": en}]) as s:
             for piece in s.text_stream:
                 acc += piece
@@ -419,6 +433,9 @@ def translate_worker():
         try:
             ko = ""
             first = None
+            if FILLER.match(en.strip()):            # 맞장구는 번역 호출 없이 그대로
+                text_q.put((seq, tag + en, tag + en))
+                continue
             for ko in translate_stream(en, list(history)):
                 if first is None:
                     first = time.time() - t0

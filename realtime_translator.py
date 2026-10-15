@@ -36,8 +36,9 @@ from openai import OpenAI
 
 INPUT_DEVICE = os.getenv("CAPTION_DEVICE", "BlackHole")  # 입력 장치 이름 일부
 SAMPLE_RATE = 16000
-# MODE=quality(기본): 문장 끝까지 기다렸다 상위 모델로 번역 / MODE=fast: 빠르지만 문장이 잘게 끊김
-MODE = os.getenv("MODE", "quality").strip().lower()
+# MODE=standard(기본): 문장 끝까지 듣고 Haiku 5.5 로 번역 (저렴·빠름)
+#      quality: 같은 방식으로 Sonnet 5.5 (정확, 비용 약 20배) / fast: Haiku 5.5, 문장을 짧게 끊어 더 빠름
+MODE = os.getenv("MODE", "standard").strip().lower()
 _Q = MODE != "fast"
 MAX_CHUNK_SEC = float(os.getenv("CHUNK_SEC", "8" if _Q else "4"))      # 이 길이를 넘으면 무조건 전송
 MIN_SPEECH_SEC = 0.6    # 이보다 짧은 소리는 버림
@@ -71,8 +72,24 @@ MIC_SILENCE_RMS = float(os.getenv("MIC_SILENCE_RMS", "0.0012"))  # 마이크: �
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
 # 앞에서부터 시도해 계정에서 쓸 수 있는 첫 모델을 사용
 MODEL_CANDIDATES = ([os.getenv("TRANSLATE_MODEL")] if os.getenv("TRANSLATE_MODEL") else []) + (
-    ["claude-sonnet-5-5", "claude-sonnet-5"] if _Q else []) + ["claude-haiku-4-5-20251001", "claude-haiku-4-5"]
+    ["claude-sonnet-5-5", "claude-sonnet-5"] if MODE == "quality" else []) + [
+    "claude-haiku-5-5", "claude-haiku-4-5-20251001", "claude-haiku-4-5"]
 TRANSLATE_MODEL = MODEL_CANDIDATES[0]
+POLISH_MODEL = "claude-sonnet-5-5"            # 회의 후 정리본·추가 언어 저장용 (한 번만 실행)
+POLISH = os.getenv("POLISH", "1") != "0"      # 회의 종료 시 Sonnet 으로 다듬은 정리본 저장
+
+
+def fast_opts(model: str) -> dict:
+    """번역에는 '생각(thinking)'이 필요 없음 → 끄고 effort 를 낮춰 비용·지연 절감."""
+    if model.startswith("claude-haiku-5"):
+        return {"extra_body": {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}}
+    if model.startswith("claude-sonnet-5-5"):
+        return {"extra_body": {"thinking": {"type": "between_tools"}, "output_config": {"effort": "low"}}}
+    return {}
+
+
+def text_of(msg) -> str:
+    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
 SOURCE_LANG = os.getenv("SOURCE_LANG", "").strip()    # STT 언어 코드. 빈값 = 자동 감지(영어·일본어 등)
 TARGET_LANG = os.getenv("TARGET_LANG", "한국어")       # 번역 목표 언어 (자연어 이름)
 REVERSE_LANG = os.getenv("REVERSE_LANG", "English")   # 화자가 이미 목표 언어로 말하면 이 언어로 번역 (빈값 = 그대로 표시)
@@ -393,7 +410,7 @@ def translate_stream(en: str, history):
     try:
         with claude.messages.stream(
                 model=TRANSLATE_MODEL, max_tokens=400, system=build_system(history, en),
-                messages=[{"role": "user", "content": en}]) as s:
+                messages=[{"role": "user", "content": en}], **fast_opts(TRANSLATE_MODEL)) as s:
             for piece in s.text_stream:
                 acc += piece
                 yield acc
@@ -512,41 +529,59 @@ def ui():
             render()
         root.after(150, poll)
 
-    def save_extra_langs():
-        """회의 종료 후 전체 원문을 다른 언어로 한 번 더 번역해 별도 파일로 저장."""
+    def save_batch(lang, suffix, note, reverse=False):
+        """회의 원문 전체를 Sonnet 5.5 로 한 번 더 번역해 별도 파일로 저장 (40문장씩)."""
         items = [sources[k] for k in sorted(sources)]
-        if not items or not EXTRA_SAVE_LANGS:
+        if not items:
             return
+        box.config(state="normal"); box.delete("1.0", "end")
+        box.insert("end", f"{note} 저장 중… ({len(items)}문장)", "ko")
+        box.config(state="disabled"); root.update()
+        rev = (f" If a line is already in {lang}, translate it into {REVERSE_LANG} instead."
+               if reverse and REVERSE_LANG else "")
+        model, out = POLISH_MODEL, []
+        try:
+            for i in range(0, len(items), 40):
+                batch = items[i:i + 40]
+                numbered = "\n".join(f"{n}. {src}" for n, (_, src) in enumerate(batch, 1))
+                text = " ".join(src for _, src in batch)
+                gl, prods = relevant(GLOSSARY, text), relevant(PRODUCT_TERMS, text)
+                system = (f"Translate this numbered business-meeting transcript into natural {lang}.{rev} "
+                          "Lines are consecutive speech recognition output: use the surrounding lines for context "
+                          "and fix obvious recognition errors. Keep the leading '(나)' speaker tag untranslated. "
+                          "Keep names and numbers exact. Use the loanwords IT/telecom professionals actually say."
+                          + (f" Keep these names in English: {prods}." if prods else "")
+                          + (f" Glossary: {gl}." if gl else "")
+                          + " Output exactly one line per input line, as 'N. translation', nothing else.")
+                for m in (model, "claude-haiku-5-5"):     # Sonnet 을 못 쓰는 계정이면 Haiku 로
+                    try:
+                        msg = claude.messages.create(model=m, max_tokens=8000, system=system,
+                                                     messages=[{"role": "user", "content": numbered}], **fast_opts(m))
+                        model = m
+                        break
+                    except Exception as e:
+                        if m != model or getattr(e, "status_code", None) not in (400, 404):
+                            raise
+                got = {}
+                for line in text_of(msg).splitlines():
+                    num, _, txt = line.partition(". ")
+                    if num.strip().isdigit():
+                        got[int(num)] = txt.strip()
+                for n, (ts, src) in enumerate(batch, 1):
+                    out.append(f"[{ts}] {got.get(n, '(번역 누락)')}\n  ({src})")
+            path = save_path[:-4] + f"_{suffix}.txt"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(out) + "\n")
+            print(f"[saved] {path}", flush=True)
+        except Exception as e:
+            print(f"[{note} 저장 오류] {e!r}", flush=True)
+
+    def save_extra_langs():
+        """회의 종료 후: 정리본(자막 언어, Sonnet) + 추가 언어 번역본."""
+        if POLISH:
+            save_batch(TARGET_LANG, "정리본", "정리본", reverse=True)
         for lang in EXTRA_SAVE_LANGS:
-            box.config(state="normal"); box.delete("1.0", "end")
-            box.insert("end", f"{lang} 번역본 저장 중… ({len(items)}문장)", "ko")
-            box.config(state="disabled"); root.update()
-            out = []
-            try:
-                for i in range(0, len(items), 40):           # 40문장씩 나눠 번역
-                    batch = items[i:i + 40]
-                    numbered = "\n".join(f"{n}. {src}" for n, (_, src) in enumerate(batch, 1))
-                    gl = f" Glossary: {GLOSSARY}." if GLOSSARY else ""
-                    msg = claude.messages.create(
-                        model=TRANSLATE_MODEL, max_tokens=8000,
-                        system=(f"Translate this numbered business-meeting transcript into natural {lang}. "
-                                "Lines are consecutive speech, use the surrounding lines for context. "
-                                "Keep the leading '(나)' speaker tag untranslated. Keep names and numbers exact."
-                                f"{gl} Output exactly one line per input line, as 'N. translation', nothing else."),
-                        messages=[{"role": "user", "content": numbered}])
-                    got = {}
-                    for line in msg.content[0].text.splitlines():
-                        num, _, txt = line.partition(". ")
-                        if num.strip().isdigit():
-                            got[int(num)] = txt.strip()
-                    for n, (ts, src) in enumerate(batch, 1):
-                        out.append(f"[{ts}] {got.get(n, '(번역 누락)')}\n  ({src})")
-                path = save_path[:-4] + f"_{lang}.txt"
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(out) + "\n")
-                print(f"[saved] {path}", flush=True)
-            except Exception as e:
-                print(f"[{lang} 저장 오류] {e!r}", flush=True)
+            save_batch(lang, lang, f"{lang} 번역본")
 
     def on_close():
         save()

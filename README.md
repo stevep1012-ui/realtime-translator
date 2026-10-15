@@ -65,7 +65,8 @@ Mac 에서 Teams/Zoom **앱**을 쓰며 안정적으로 쓰려면 아래 데스�
 ```
 SOURCE_LANG=              # 비우면 자동 감지. 한 언어로 고정: en, ja, zh, de, fr, es …
 TARGET_LANG=한국어         # 자막 언어
-MODE=quality              # quality = 정확(지연 3~4초) / fast = 빠름(1~2초)
+MODE=standard             # standard = Haiku 5.5 (기본, 저렴) / quality = Sonnet 5.5 (정확) / fast = 1~2초
+POLISH=0                  # 회의 후 Sonnet 정리본(_정리본.txt) 저장 끄기 (기본: 저장)
 EXTRA_SAVE_LANGS=日本語    # 회의 종료 후 다른 언어로도 저장 (쉼표로 여러 개)
 GLOSSARY=AICC=AI 컨택센터  # 고정 번역 (license=라이센스 등 IT 용어는 내장)
 PRODUCT_TERMS=고객사명     # 번역하지 않고 영어 그대로 둘 이름 (Mitel, MiCollab 등은 내장)

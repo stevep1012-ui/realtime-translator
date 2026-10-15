@@ -164,13 +164,17 @@ const PRODUCT_TERMS="Mitel, MiCollab, MiVoice Business, MiVoice Connect, MiVoice
 const TERM_FIXES=[[/\b(?:my|mi|me)[\s-]?collab\b/gi,"MiCollab"],[/\b(?:my|mi)[\s-]?contact center\b/gi,"MiContact Center"],[/\bmi[\s-]?cloud\b/gi,"MiCloud"],[/\bmy[\s-]?voice (business|connect)\b/gi,(_,x)=>"MiVoice "+x[0].toUpperCase()+x.slice(1).toLowerCase()],[/\bmy[\s-]tel\b/gi,"Mitel"]];
 function fixTerms(t){ for(const [p,r] of TERM_FIXES) t=t.replace(p,r); return t; }
 const TECH_GLOSSARY="license=라이센스, licensing=라이센싱, subscription=구독, server=서버, cloud=클라우드, on-premise=온프레미스, platform=플랫폼, solution=솔루션, deployment=구축, integration=연동, migration=마이그레이션, contact center=컨택센터, seat=시트, SIP trunk=SIP 트렁크, pipeline=파이프라인, partner=파트너, renewal=갱신";
-function sysPrompt(){
+// 용어집·제품명 중 이번 문장(과 직전 문장)에 나온 것만 보내 토큰 절약
+function relevant(items,text){ const t=text.toLowerCase(); return items.split(",").map(x=>x.trim()).filter(x=>x&&t.includes(x.split("=")[0].trim().toLowerCase())).join(", "); }
+const FILLER=/^(?:(?:ok(?:ay)?|yeah|yes|yep|right|sure|uh-?huh|mm+|hmm+|um+|uh+|ah+|oh|네|예|음+|아+|어+|그렇죠|맞아요|좋아요|はい|ええ|うん)[\s.,!?…]*)+$/i;  // 맞장구는 번역 호출 안 함
+function sysPrompt(text=""){
+  const seen=text+" "+hist.map(([a])=>a).join(" "), gloss=relevant([cfg.gloss,TECH_GLOSSARY].filter(Boolean).join(", "),seen), prods=relevant(PRODUCT_TERMS,seen);
   const rev=cfg.rev?`If the new line is already in ${cfg.tgt}, translate it into ${cfg.rev} instead. `:`If the new line is already in ${cfg.tgt}, output it unchanged. `;
   const ctx=hist.map(([a,b])=>`- ${a}  =>  ${b}`).join("\n")||"(none)";
   return `You are a professional simultaneous interpreter subtitling a live business meeting into ${cfg.tgt}. ${rev}`+
     `The new line comes from speech recognition and may be a fragment of a longer sentence: use the recent conversation to resolve meaning, pronouns and terminology, and keep wording consistent with earlier translations. `+
-    `Translate meaning, not word-for-word; use natural spoken business ${cfg.tgt}. Keep names, product names, numbers and units exact. For IT/telecom/enterprise-software terms, use the loanword professionals actually say (e.g. in Korean: license → 라이센스, not 허가), not a literal dictionary word. Never translate or transliterate these product/company names, write them exactly in English: ${PRODUCT_TERMS}. Output only the translation of the new line, no notes or quotes.`+
-    `\n\nRecent conversation (source => translation):\n${ctx}`+`\nGlossary (always use these renderings): ${[cfg.gloss,TECH_GLOSSARY].filter(Boolean).join(", ")}`;
+    `Translate meaning, not word-for-word; use natural spoken business ${cfg.tgt}. Keep names, product names, numbers and units exact. For IT/telecom/enterprise-software terms, use the loanword professionals actually say (e.g. in Korean: license → 라이센스, not 허가), not a literal dictionary word. ${prods?`Never translate or transliterate these product/company names, write them exactly in English: ${prods}. `:""}Output only the translation of the new line, no notes or quotes.`+
+    `\n\nRecent conversation (source => translation):\n${ctx}`+(gloss?`\nGlossary (always use these renderings): ${gloss}`:"");
 }
 // 앞에서부터 시도해 계정에서 쓸 수 있는 첫 모델을 기억
 const MODELS={quality:["claude-sonnet-5-5","claude-sonnet-5","claude-haiku-4-5-20251001","claude-haiku-4-5"],
@@ -182,7 +186,7 @@ async function translateStream(text,onText){
   for(const model of goodModel[mode]?[goodModel[mode]]:MODELS[mode]){
     r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
       "content-type":"application/json","x-api-key":cfg.akey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model,max_tokens:400,stream:true,system:sysPrompt(),messages:[{role:"user",content:text}]})});
+      body:JSON.stringify({model,max_tokens:400,stream:true,system:sysPrompt(text),messages:[{role:"user",content:text}]})});
     if(r.ok){ if(goodModel[mode]!==model&&running) setStat("듣는 중 · "+model.replace("claude-","").replace(/-\d{8}$/,""),true); goodModel[mode]=model; break; }
     err=await apiError(r);
     if(r.status!==404&&r.status!==400) break;   // 모델 문제가 아니면 다른 모델 시도 안 함
@@ -193,7 +197,7 @@ async function translateStream(text,onText){
     const lines=buf.split("\n"); buf=lines.pop();
     for(const l of lines){ if(!l.startsWith("data:")) continue; try{ const j=JSON.parse(l.slice(5));
       if(j.type==="content_block_delta"&&j.delta?.text){ acc+=j.delta.text; onText(acc); } }catch(e){} } }
-  hist.push([text,acc]); while(hist.length>(Q()?6:3)) hist.shift(); return acc;
+  hist.push([text,acc]); while(hist.length>(Q()?4:2)) hist.shift(); return acc;
 }
 const queue=[]; let busy=false, tchain=Promise.resolve();
 async function pump(){
@@ -202,6 +206,7 @@ async function pump(){
     try{ const src=await transcribe(wav,tag); if(!src){ el.remove(); history.pop(); continue; }
       lastSrcBy[tag]=src.slice(-200);
       rec.src=tag+src; el.querySelector(".src").textContent=tag+src;
+      if(FILLER.test(src.trim())){ rec.ko=tag+src; el.querySelector(".ko").textContent=rec.ko; el.classList.remove("pending"); continue; }
       // 인식은 계속 진행, 번역은 순서대로 (직전 번역을 문맥으로 쓰기 위해)
       tchain=tchain.then(()=>translateStream(src,t=>{ rec.ko=tag+t; el.querySelector(".ko").textContent=rec.ko; feed.scrollTop=feed.scrollHeight; }))
         .then(()=>el.classList.remove("pending"))

@@ -94,7 +94,7 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
   <div class="field"><label for="src">화자 언어</label><select id="src"><option value="">자동 감지 (영어·일본어 등 섞여도 됨)</option><option value="en">영어</option><option value="ja">일본어</option><option value="zh">중국어</option><option value="es">스페인어</option><option value="fr">프랑스어</option><option value="de">독일어</option><option value="ko">한국어</option></select></div>
   <div class="field"><label for="tgt">자막 언어</label><input id="tgt" value="한국어"></div>
   <div class="field"><label for="rev">자막 언어로 말할 때 번역할 언어 (비우면 번역 안 함)</label><input id="rev" value="English"></div>
-  <div class="field"><label for="mode">번역 방식</label><select id="mode"><option value="quality">품질 우선 (문장 끝까지 듣고 번역, 3~4초)</option><option value="fast">속도 우선 (1~2초, 문장이 잘게 끊김)</option></select></div>
+  <div class="field"><label for="mode">번역 방식</label><select id="mode"><option value="standard">기본 (문장 끝까지 듣고 번역, 저렴)</option><option value="quality">고품질 (Sonnet, 비용 약 20배)</option><option value="fast">속도 우선 (1~2초, 문장이 잘게 끊김)</option></select></div>
   <div class="field"><label for="gloss">용어집 (선택, 쉼표로 구분)</label><input id="gloss" placeholder="Mitel=마이텔, AICC=AI 컨택센터"></div>
   <div class="err" id="err"></div>
   <div class="hint" id="keyState"></div>
@@ -111,9 +111,9 @@ textarea{width:100%;box-sizing:border-box;height:40vh;border:1px solid var(--lin
 <script>
 (() => {
 const $ = id => document.getElementById(id);
-const cfg = {okey:"", akey:"", src:"", tgt:"한국어", rev:"English", mode:"quality", gloss:"", audio:"both"};
+const cfg = {okey:"", akey:"", src:"", tgt:"한국어", rev:"English", mode:"standard", gloss:"", audio:"both", v:2};
 const store = {
-  load(){ try{ Object.assign(cfg, JSON.parse(localStorage.getItem("rt_cfg")||"{}")); }catch(e){} },
+  load(){ try{ const s=JSON.parse(localStorage.getItem("rt_cfg")||"{}"); if(!s.v&&s.mode==="quality") s.mode="standard"; Object.assign(cfg,s,{v:2}); }catch(e){} },  // 예전 기본값(Sonnet)은 새 기본값으로
   save(){ try{ localStorage.setItem("rt_cfg", JSON.stringify(cfg)); }catch(e){}
     try{ navigator.storage?.persist?.(); }catch(e){} }   // 브라우저가 저장값을 지우지 않도록 요청
 };
@@ -177,16 +177,20 @@ function sysPrompt(text=""){
     `\n\nRecent conversation (source => translation):\n${ctx}`+(gloss?`\nGlossary (always use these renderings): ${gloss}`:"");
 }
 // 앞에서부터 시도해 계정에서 쓸 수 있는 첫 모델을 기억
-const MODELS={quality:["claude-sonnet-5-5","claude-sonnet-5","claude-haiku-4-5-20251001","claude-haiku-4-5"],
-              fast:["claude-haiku-4-5-20251001","claude-haiku-4-5"]};
+const MODELS={quality:["claude-sonnet-5-5","claude-sonnet-5","claude-haiku-5-5","claude-haiku-4-5-20251001"],
+              standard:["claude-haiku-5-5","claude-haiku-4-5-20251001","claude-haiku-4-5"]};
+MODELS.fast=MODELS.standard;
+// 번역에는 '생각(thinking)'이 필요 없음 → 끄고 effort 를 낮춰 비용·지연 절감
+const fastOpts=m=>m.startsWith("claude-haiku-5")?{thinking:{type:"disabled"},output_config:{effort:"low"}}
+  :m.startsWith("claude-sonnet-5-5")?{thinking:{type:"between_tools"},output_config:{effort:"low"}}:{};
 const goodModel={};
 async function apiError(r){ try{ const j=await r.json(); return r.status+" "+(j.error?.message||""); }catch(e){ return String(r.status); } }
 async function translateStream(text,onText){
-  const mode=Q()?"quality":"fast"; let r, err="";
+  const mode=MODELS[cfg.mode]?cfg.mode:"standard"; let r, err="";
   for(const model of goodModel[mode]?[goodModel[mode]]:MODELS[mode]){
     r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
       "content-type":"application/json","x-api-key":cfg.akey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model,max_tokens:400,stream:true,system:sysPrompt(text),messages:[{role:"user",content:text}]})});
+      body:JSON.stringify({model,max_tokens:400,stream:true,system:sysPrompt(text),messages:[{role:"user",content:text}],...fastOpts(model)})});
     if(r.ok){ if(goodModel[mode]!==model&&running) setStat("듣는 중 · "+model.replace("claude-","").replace(/-\d{8}$/,""),true); goodModel[mode]=model; break; }
     err=await apiError(r);
     if(r.status!==404&&r.status!==400) break;   // 모델 문제가 아니면 다른 모델 시도 안 함
